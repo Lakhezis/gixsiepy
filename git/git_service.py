@@ -1,11 +1,17 @@
 """Operaciones Git mediante el ejecutable instalado en el sistema."""
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import tempfile
+
+
+MAX_DIFF_BYTES = 512 * 1024
+MAX_DIFF_LINES = 5000
 
 
 class GitServiceError(Exception):
@@ -31,11 +37,44 @@ class GitServiceError(Exception):
 
 
 @dataclass(frozen=True)
+class FileDiff:
+    path: str
+    staged: bool
+    text: str = ""
+    message: str = ""
+    binary: bool = False
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: str
+    index_status: str = "."
+    working_status: str = "."
+    original_path: str | None = None
+    submodule: str = "N..."
+    conflicted: bool = False
+
+    @property
+    def is_staged(self):
+        return self.index_status != "." and not self.conflicted
+
+    @property
+    def is_unstaged(self):
+        return self.working_status != "." or self.conflicted
+
+    @property
+    def can_stage(self):
+        return self.is_unstaged and not self.conflicted and not self.submodule.startswith("S")
+
+
+@dataclass(frozen=True)
 class RepositoryInfo:
     selected_path: Path
     root_path: Path | None = None
     branch: str | None = None
     head_short: str | None = None
+    files: tuple[FileChange, ...] = ()
 
     @property
     def is_repository(self):
@@ -50,12 +89,24 @@ class RepositoryInfo:
     def has_commits(self):
         return self.head_short is not None
 
+    @property
+    def unstaged_files(self):
+        return tuple(file for file in self.files if file.is_unstaged)
+
+    @property
+    def staged_files(self):
+        return tuple(file for file in self.files if file.is_staged)
+
+    @property
+    def can_stage_all(self):
+        return bool(self.unstaged_files) and all(file.can_stage for file in self.unstaged_files)
+
 
 class GitService:
     def __init__(self, timeout=30):
         self.timeout = timeout
 
-    def _run(self, arguments, *, cwd=None, accepted_codes=(0,)):
+    def _run(self, arguments, *, cwd=None, accepted_codes=(0,), stdout_limit=None):
         executable = shutil.which("git")
         if executable is None:
             raise GitServiceError(
@@ -70,11 +121,19 @@ class GitService:
         environment["LC_ALL"] = "C"
         environment["GIT_TERMINAL_PROMPT"] = "0"
         try:
-            result = subprocess.run(
-                command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, encoding="utf-8",
-                errors="surrogateescape", timeout=self.timeout, shell=False,
-            )
+            # Un diff grande se almacena temporalmente en disco, no entero en memoria.
+            with (tempfile.TemporaryFile() if stdout_limit is not None else nullcontext()) as output:
+                result = subprocess.run(
+                    command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+                    stdout=output if output is not None else subprocess.PIPE,
+                    stderr=subprocess.PIPE, timeout=self.timeout, shell=False,
+                )
+                result.stdout_truncated = False
+                if output is not None:
+                    output.seek(0)
+                    data = output.read(stdout_limit + 1)
+                    result.stdout = data[:stdout_limit]
+                    result.stdout_truncated = len(data) > stdout_limit
         except FileNotFoundError as error:
             raise GitServiceError(
                 "No se pudo ejecutar Git. Comprobá que Git esté instalado "
@@ -90,6 +149,11 @@ class GitService:
                 "No se pudo acceder a la carpeta o ejecutar Git. Revisá los permisos.",
                 command=command, stderr=str(error),
             ) from error
+        # Decodificar sin universal-newlines: \r y \n pueden ser parte de una ruta.
+        if isinstance(result.stdout, bytes):
+            result.stdout = result.stdout.decode("utf-8", errors="surrogateescape")
+        if isinstance(result.stderr, bytes):
+            result.stderr = result.stderr.decode("utf-8", errors="surrogateescape")
         if result.returncode not in accepted_codes:
             raise self._command_error(result)
         return result
@@ -148,11 +212,144 @@ class GitService:
             ["rev-parse", "--verify", "--quiet", "--short", "HEAD"],
             cwd=root_path, accepted_codes=(0, 1),
         )
+        status = self._run(
+            ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z",
+             "--untracked-files=all", "--renames", "--ignore-submodules=none"],
+            cwd=root_path,
+        )
         return RepositoryInfo(
             selected_path=folder, root_path=root_path,
             branch=branch.stdout.strip() if branch.returncode == 0 else None,
             head_short=head.stdout.strip() if head.returncode == 0 else None,
+            files=self._parse_status(status.stdout),
         )
+
+    @staticmethod
+    def _parse_status(output):
+        files = []
+        records = iter(output.split("\0"))
+        try:
+            for record in records:
+                if not record or record.startswith(("# ", "! ")):
+                    continue
+                if record.startswith("? "):
+                    files.append(FileChange(path=record[2:], working_status="?"))
+                    continue
+                kind = record[0]
+                field_count = {"1": 8, "2": 9, "u": 10}[kind]
+                fields = record.split(" ", field_count)
+                if len(fields) != field_count + 1 or len(fields[1]) != 2:
+                    raise ValueError("Registro Git incompleto")
+                original_path = next(records) if kind == "2" else None
+                if not fields[-1] or original_path == "":
+                    raise ValueError("Ruta Git vacía")
+                files.append(FileChange(
+                    path=fields[-1], index_status=fields[1][0], working_status=fields[1][1],
+                    submodule=fields[2], original_path=original_path, conflicted=kind == "u",
+                ))
+        except (KeyError, ValueError, StopIteration) as error:
+            raise GitServiceError(
+                "No se pudo interpretar el estado del repositorio. Probá actualizarlo.",
+                stdout=output,
+            ) from error
+        return tuple(sorted(files, key=lambda file: (file.path.casefold(), file.path)))
+
+    def _working_repository(self, path):
+        info = self.inspect_repository(path)
+        if not info.is_repository:
+            raise GitServiceError("Abrí o inicializá un repositorio antes de preparar archivos.")
+        return info
+
+    @staticmethod
+    def _current_file(info, path):
+        # Usar exclusivamente una ruta exacta que Git acaba de informar.
+        for file in info.files:
+            if file.path == path:
+                return file
+        raise GitServiceError("El archivo ya no aparece entre los cambios. Actualizá el repositorio.")
+
+    def stage_file(self, repository_path, file_path):
+        info = self._working_repository(repository_path)
+        file = self._current_file(info, file_path)
+        if not file.can_stage:
+            raise GitServiceError(
+                "Este archivo no se puede preparar desde esta vista. "
+                "Los conflictos y los cambios internos de submódulos requieren otra herramienta."
+            )
+        paths = [file.path]
+        if file.working_status == "R" and file.original_path:
+            paths.insert(0, file.original_path)
+        self._run(["add", "-A", "--", *paths], cwd=info.root_path)
+        return self.inspect_repository(repository_path)
+
+    def get_diff(self, repository_path, file_path, *, staged=False):
+        info = self._working_repository(repository_path)
+        file = self._current_file(info, file_path)
+        if file.conflicted:
+            return FileDiff(file.path, staged, message="Este archivo tiene conflictos. Resolvelos con otra herramienta.")
+        if (staged and not file.is_staged) or (not staged and not file.is_unstaged):
+            raise GitServiceError("Esta versión del archivo ya no tiene cambios. Actualizá el repositorio.")
+        options = [
+            "diff", "--patch", "--no-color", "--no-ext-diff", "--no-textconv",
+            "--no-relative", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3",
+        ]
+        if file.working_status == "?" and not staged:
+            if file.path.endswith("/"):
+                return FileDiff(file.path, staged, message="Esta entrada es otro repositorio. Abrí su carpeta para ver sus archivos.")
+            arguments = [*options, "--no-index", "--", "/dev/null", file.path]
+            accepted_codes = (0, 1)  # --no-index usa 1 para indicar diferencias.
+        else:
+            paths = [file.path]
+            code = file.index_status if staged else file.working_status
+            if code in ("R", "C") and file.original_path:
+                paths.insert(0, file.original_path)
+            arguments = [*options, *(["--cached"] if staged else []), "--", *paths]
+            accepted_codes = (0,)
+        result = self._run(
+            arguments, cwd=info.root_path, accepted_codes=accepted_codes, stdout_limit=MAX_DIFF_BYTES,
+        )
+        if result.stderr.startswith(("error:", "fatal:")):
+            raise self._command_error(result)
+        text = result.stdout
+        binary = any(line.startswith(("Binary files ", "GIT binary patch")) for line in text.split("\n"))
+        truncated = result.stdout_truncated
+        lines = text.split("\n")
+        if len(lines) - int(text.endswith("\n")) > MAX_DIFF_LINES:
+            text = "\n".join(lines[:MAX_DIFF_LINES]) + "\n"
+            truncated = True
+        message = ""
+        if binary:
+            message = "Git detectó un archivo binario. Sus cambios no se pueden mostrar como líneas de texto."
+        elif not text:
+            message = "No hay diferencias de texto para esta selección. El archivo puede estar vacío o haber cambiado desde la última actualización."
+        return FileDiff(file.path, staged, text=text, message=message, binary=binary, truncated=truncated)
+
+    def unstage_file(self, repository_path, file_path):
+        info = self._working_repository(repository_path)
+        file = self._current_file(info, file_path)
+        if not file.is_staged:
+            raise GitServiceError("Este archivo no tiene cambios preparados para commit.")
+        paths = [file.path]
+        if file.index_status == "R" and file.original_path:
+            paths.insert(0, file.original_path)
+        if info.has_commits:
+            self._run(["restore", "--staged", "--", *paths], cwd=info.root_path)
+        else:
+            # Sin HEAD, quitar únicamente la entrada del índice; nunca el archivo.
+            self._run(["update-index", "--force-remove", "--", *paths], cwd=info.root_path)
+        return self.inspect_repository(repository_path)
+
+    def stage_all(self, repository_path):
+        info = self._working_repository(repository_path)
+        if not info.unstaged_files:
+            return info
+        if not info.can_stage_all:
+            raise GitServiceError(
+                "Hay conflictos o cambios en submódulos. Revisalos con otra herramienta "
+                "antes de preparar todos los cambios. Podés preparar los demás archivos uno a uno."
+            )
+        self._run(["add", "-A"], cwd=info.root_path)
+        return self.inspect_repository(repository_path)
 
     def initialize_repository(self, path):
         """Invocar solamente después de la confirmación explícita en la UI."""

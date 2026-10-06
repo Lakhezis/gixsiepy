@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import time
@@ -34,8 +35,9 @@ class WindowTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="gixsie-ui-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.folder = Path(self.temporary.name)
-        configuration = self.folder / "config"
+        self.folder = Path(self.temporary.name) / "repositorio"
+        self.folder.mkdir()
+        configuration = Path(self.temporary.name) / "config"
         configuration.write_text("[init]\n\tdefaultBranch = main\n", encoding="utf-8")
         environment = patch.dict(os.environ, {
             "GIT_CONFIG_GLOBAL": str(configuration), "GIT_CONFIG_NOSYSTEM": "1",
@@ -47,10 +49,12 @@ class WindowTests(unittest.TestCase):
         self.pump_until(lambda: self.window.get_mapped())
 
     def tearDown(self):
-        self.pump_until(lambda: not self.window.tasks.busy)
+        self.pump_until(lambda: not self.window.tasks.busy and not self.window.diff_tasks.busy
+                        and self.window._pending_diff is None)
         for window in list(self.Gtk.Window.get_toplevels()):
             window.destroy()
         self.window.tasks.close()
+        self.window.diff_tasks.close()
         self.pump()
 
     def pump(self):
@@ -70,6 +74,21 @@ class WindowTests(unittest.TestCase):
     def open_folder(self):
         self.window.open_repository(self.folder)
         self.pump_until(lambda: not self.window.tasks.busy)
+
+    def wait_for_diff(self):
+        self.pump_until(lambda: not self.window.diff_tasks.busy and self.window._pending_diff is None)
+
+    def diff_text(self):
+        buffer = self.window.diff_panel.buffer
+        return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+
+    def create_repository(self):
+        self.window.service.initialize_repository(self.folder)
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", *arguments], cwd=self.folder, check=True, capture_output=True, text=True,
+        ).stdout.strip()
 
     def test_welcome_and_css_render_without_parsing_errors(self):
         provider = self.Gtk.CssProvider()
@@ -222,6 +241,289 @@ class WindowTests(unittest.TestCase):
         child.set_expanded(True)
         buffer = child.get_child().get_child().get_buffer()
         self.assertIn("Permission denied", buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False))
+
+    def test_clean_repository_disables_all_staging_buttons(self):
+        self.create_repository()
+        self.open_folder()
+        panel = self.window.files_panel
+        self.assertTrue(panel.get_visible())
+        self.assertEqual(panel.changes_count.get_text(), "0")
+        self.assertEqual(panel.staged_count.get_text(), "0")
+        self.assertFalse(panel.stage_button.get_sensitive())
+        self.assertFalse(panel.unstage_button.get_sensitive())
+        self.assertFalse(panel.stage_all_button.get_sensitive())
+
+    def test_selecting_a_file_enables_stage_without_preparing_it(self):
+        self.create_repository()
+        (self.folder / "nuevo.txt").write_text("contenido", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        self.assertFalse(panel.stage_button.get_sensitive())
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        self.assertTrue(panel.stage_button.get_sensitive())
+        self.assertEqual(panel.selected_file.path, "nuevo.txt")
+        self.assertEqual(self.git("ls-files"), "")
+
+    def test_stage_and_unstage_buttons_update_both_groups_and_prevent_double_click(self):
+        self.create_repository()
+        file = self.folder / "a.txt"
+        file.write_text("contenido", encoding="utf-8")
+        (self.folder / "b.txt").write_text("otro", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        with patch.object(self.window.service, "stage_file", wraps=self.window.service.stage_file) as stage:
+            panel.stage_button.emit("clicked")
+            panel.stage_button.emit("clicked")
+            self.assertFalse(panel.stage_all_button.get_sensitive())
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertEqual(stage.call_count, 1)
+        self.assertEqual(panel.changes_count.get_text(), "1")
+        self.assertEqual(panel.staged_count.get_text(), "1")
+        self.assertEqual(panel.selected_group, "staged")
+        self.assertEqual(self.git("ls-files"), "a.txt")
+        self.assertIn("Archivo preparado", self.window.status_label.get_text())
+        panel.unstage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.changes_count.get_text(), "2")
+        self.assertEqual(panel.staged_count.get_text(), "0")
+        self.assertEqual(panel.selected_group, "changes")
+        self.assertEqual(file.read_text(encoding="utf-8"), "contenido")
+        self.assertIn("conservaron", self.window.status_label.get_text())
+
+    def test_prepare_all_automatically_refreshes_lists(self):
+        self.create_repository()
+        for name in ("a.txt", "b.txt"):
+            (self.folder / name).write_text(name, encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.stage_all_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.changes_count.get_text(), "0")
+        self.assertEqual(panel.staged_count.get_text(), "2")
+        self.assertFalse(panel.stage_all_button.get_sensitive())
+        self.assertEqual(self.git("ls-files"), "a.txt\nb.txt")
+
+    def test_partial_staging_shows_file_in_both_groups_with_one_selection(self):
+        self.create_repository()
+        file = self.folder / "a.txt"
+        file.write_text("preparado", encoding="utf-8")
+        self.window.service.stage_file(self.folder, "a.txt")
+        file.write_text("otra edición", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        self.assertEqual(panel.changes_count.get_text(), "1")
+        self.assertEqual(panel.staged_count.get_text(), "1")
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        self.assertTrue(panel.stage_button.get_sensitive())
+        panel.staged_list.select_row(panel.staged_list.get_row_at_index(0))
+        self.assertIsNone(panel.changes_list.get_selected_row())
+        self.assertTrue(panel.unstage_button.get_sensitive())
+        self.assertFalse(panel.stage_button.get_sensitive())
+        self.assertEqual(self.git("show", ":a.txt"), "preparado")
+
+    def test_refresh_keeps_selection_and_switching_repository_clears_it(self):
+        self.create_repository()
+        (self.folder / "a.txt").write_text("contenido", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.selected_file.path, "a.txt")
+        other = Path(self.temporary.name) / "otra carpeta"
+        other.mkdir()
+        self.window.service.initialize_repository(other)
+        (other / "a.txt").write_text("otro repositorio", encoding="utf-8")
+        self.window.open_repository(other)
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertIsNone(panel.selected_file)
+        self.assertFalse(panel.stage_button.get_sensitive())
+
+    def test_failed_stage_refreshes_external_changes_and_keeps_git_error_visible(self):
+        self.create_repository()
+        file = self.folder / "a.txt"
+        file.write_text("contenido", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        file.unlink()
+        panel.stage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.changes_count.get_text(), "0")
+        self.assertFalse(panel.stage_button.get_sensitive())
+        self.assertIn("ya no aparece", self.window.status_label.get_text())
+
+    def test_unusual_filename_renders_and_stages_its_original_path(self):
+        self.create_repository()
+        name = os.fsdecode(b"nombre-\xff\r\n.txt")
+        (self.folder / name).write_bytes(b"contenido")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        panel.stage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.selected_file.path, name)
+        self.assertEqual(panel.staged_count.get_text(), "1")
+
+    def test_diff_selection_displays_new_file_and_applies_line_tags(self):
+        self.create_repository()
+        (self.folder / "nuevo.txt").write_text("primera línea\n+++contenido\n", encoding="utf-8")
+        self.open_folder()
+        self.window.files_panel.changes_list.select_row(self.window.files_panel.changes_list.get_row_at_index(0))
+        self.wait_for_diff()
+        text = self.diff_text()
+        self.assertIn("+primera línea\n", text)
+        self.assertEqual(self.window.diff_panel.path_label.get_text(), "nuevo.txt")
+        buffer = self.window.diff_panel.buffer
+        for fragment, expected_tag in (("+++ b/", "header"), ("+primera línea", "added"), ("++++contenido", "added")):
+            with self.subTest(fragment=fragment):
+                offset = text.index(fragment)
+                tags = [tag.props.name for tag in buffer.get_iter_at_offset(offset).get_tags()]
+                self.assertIn(expected_tag, tags)
+        self.assertEqual(self.git("ls-files"), "")
+        self.assertTrue(self.window.diff_panel.text_view.get_monospace())
+        self.assertFalse(self.window.diff_panel.text_view.get_editable())
+
+    def test_diff_selection_distinguishes_staged_from_local_edits(self):
+        self.create_repository()
+        file = self.folder / "a.txt"
+        file.write_text("versión preparada\n", encoding="utf-8")
+        self.window.service.stage_file(self.folder, "a.txt")
+        file.write_text("versión local\n", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        self.wait_for_diff()
+        text = self.diff_text()
+        self.assertIn("-versión preparada\n", text)
+        self.assertIn("+versión local\n", text)
+        removed = self.window.diff_panel.buffer.get_iter_at_offset(text.index("-versión preparada"))
+        self.assertIn("removed", [tag.props.name for tag in removed.get_tags()])
+        self.assertIn("Sin preparar", self.window.diff_panel.comparison_label.get_text())
+        panel.staged_list.select_row(panel.staged_list.get_row_at_index(0))
+        self.wait_for_diff()
+        self.assertIn("+versión preparada\n", self.diff_text())
+        self.assertNotIn("versión local", self.diff_text())
+        self.assertIn("Preparado", self.window.diff_panel.comparison_label.get_text())
+
+    def test_diff_refreshes_after_stage_unstage_and_manual_update(self):
+        self.create_repository()
+        file = self.folder / "a.txt"
+        file.write_text("primera edición\n", encoding="utf-8")
+        self.open_folder()
+        panel = self.window.files_panel
+        panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+        self.wait_for_diff()
+        panel.stage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_diff()
+        self.assertIn("Preparado", self.window.diff_panel.comparison_label.get_text())
+        self.assertIn("+primera edición\n", self.diff_text())
+        panel.unstage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_diff()
+        self.assertIn("Sin preparar", self.window.diff_panel.comparison_label.get_text())
+        file.write_text("segunda edición\n", encoding="utf-8")
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_diff()
+        self.assertIn("+segunda edición\n", self.diff_text())
+        self.assertNotIn("+primera edición\n", self.diff_text())
+
+    def test_diff_of_binary_file_has_a_readable_explanation(self):
+        self.create_repository()
+        (self.folder / "imagen.bin").write_bytes(b"\0\xffdatos")
+        self.open_folder()
+        self.window.files_panel.changes_list.select_row(self.window.files_panel.changes_list.get_row_at_index(0))
+        self.wait_for_diff()
+        self.assertTrue(self.window.diff_panel.message_label.get_visible())
+        self.assertIn("binario", self.window.diff_panel.message_label.get_text())
+
+    def test_large_diff_displays_a_truncation_notice(self):
+        self.create_repository()
+        (self.folder / "grande.txt").write_text("una línea\n" * 5100, encoding="utf-8")
+        self.open_folder()
+        self.window.files_panel.changes_list.select_row(self.window.files_panel.changes_list.get_row_at_index(0))
+        self.wait_for_diff()
+        self.assertIn("recortada", self.window.diff_panel.message_label.get_text())
+        self.assertLessEqual(self.window.diff_panel.buffer.get_line_count(), 5001)
+
+    def test_fast_selection_keeps_gtk_responsive_and_discards_older_diff(self):
+        from git.git_service import FileDiff
+        self.create_repository()
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (self.folder / name).write_text(name, encoding="utf-8")
+        self.open_folder()
+        release = threading.Event()
+        started = threading.Event()
+
+        def delayed_diff(_root, path, *, staged):
+            if path == "a.txt":
+                started.set()
+                release.wait(timeout=3)
+            return FileDiff(path, staged, text=f"+Contenido de {path}\n")
+
+        with patch.object(self.window.service, "get_diff", side_effect=delayed_diff) as read:
+            panel = self.window.files_panel
+            panel.changes_list.select_row(panel.changes_list.get_row_at_index(0))
+            self.pump_until(started.is_set)
+            try:
+                panel.changes_list.select_row(panel.changes_list.get_row_at_index(1))
+                panel.changes_list.select_row(panel.changes_list.get_row_at_index(2))
+                self.assertTrue(panel.changes_list.get_sensitive())
+                self.assertTrue(panel.stage_button.get_sensitive())
+                self.assertEqual(self.diff_text(), "")
+                self.assertEqual(self.window.diff_panel.path_label.get_text(), "c.txt")
+            finally:
+                release.set()
+            self.wait_for_diff()
+            self.assertIn("Contenido de c.txt", self.diff_text())
+            self.assertNotIn("Contenido de a.txt", self.diff_text())
+            self.assertEqual([call.args[1] for call in read.call_args_list], ["a.txt", "c.txt"])
+
+    def test_switching_repository_discards_a_diff_still_loading(self):
+        from git.git_service import FileDiff
+        self.create_repository()
+        (self.folder / "a.txt").write_text("contenido", encoding="utf-8")
+        self.open_folder()
+        other = Path(self.temporary.name) / "otro repo"
+        other.mkdir()
+        self.window.service.initialize_repository(other)
+        release = threading.Event()
+        started = threading.Event()
+
+        def delayed_diff(*args, **kwargs):
+            started.set()
+            release.wait(timeout=3)
+            return FileDiff("a.txt", False, text="+Repositorio anterior\n")
+
+        with patch.object(self.window.service, "get_diff", side_effect=delayed_diff):
+            self.window.files_panel.changes_list.select_row(self.window.files_panel.changes_list.get_row_at_index(0))
+            self.pump_until(started.is_set)
+            try:
+                self.window.open_repository(other)
+                self.pump_until(lambda: not self.window.tasks.busy)
+            finally:
+                release.set()
+            self.wait_for_diff()
+        self.assertEqual(self.diff_text(), "")
+        self.assertIsNone(self.window.files_panel.selected_file)
+
+    def test_diff_error_offers_original_git_details(self):
+        from git.git_service import GitServiceError
+        self.create_repository()
+        (self.folder / "a.txt").write_text("contenido", encoding="utf-8")
+        self.open_folder()
+        error = GitServiceError("No se pudo leer el diff", stderr="Git original error", returncode=128)
+        with patch.object(self.window.service, "get_diff", side_effect=error):
+            self.window.files_panel.changes_list.select_row(self.window.files_panel.changes_list.get_row_at_index(0))
+            self.wait_for_diff()
+        self.assertEqual(self.window.diff_panel.message_label.get_text(), str(error))
+        self.assertTrue(self.window.diff_panel.details_button.get_visible())
+        with patch.object(self.window.diff_panel, "on_details") as details:
+            self.window.diff_panel.details_button.emit("clicked")
+            details.assert_called_once_with(error)
 
 
 if __name__ == "__main__":

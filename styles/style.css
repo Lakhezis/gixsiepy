@@ -70,3 +70,40 @@
 .git-gui .status-error { color: #823746; }
 .git-gui textview, .git-gui textview text { background-color: #fff9f8; color: #0d2426; }
 .git-gui scrollbar slider { min-width: 8px; min-height: 8px; }
+.git-gui .repository-summary { padding: 20px 24px; }
+.git-gui .repository-summary .hero-title { font-size: 22px; }
+.git-gui .files-group {
+  background-color: #fffdfb;
+  border: 1px solid #f0dfe3;
+  border-radius: 20px;
+  padding: 20px;
+}
+.git-gui .staged-group { border-color: #e4d4eb; background-color: #fff8ff; }
+.git-gui .files-heading { font-size: 14px; font-weight: 700; }
+.git-gui .file-count { background-color: #fce1fc; border-radius: 10px; padding: 4px 10px; }
+.git-gui .files-list { background-color: transparent; }
+.git-gui .files-list row { padding: 7px 8px; border-radius: 12px; color: #0d2426; }
+.git-gui .files-list row:selected { background-color: #fce1fc; color: #0d2426; }
+.git-gui .files-list row:selected label { color: #0d2426; }
+.git-gui .files-list row:hover { background-color: #fff0ee; }
+.git-gui .files-list row:selected:hover { background-color: #f6d4f6; }
+.git-gui .empty-files { padding: 22px 12px; color: #727259; }
+.git-gui .file-state { border-radius: 8px; padding: 5px 7px; font-weight: 700; color: #0d2426; }
+.git-gui .state-modified { background-color: #fbe29b; }
+.git-gui .state-added { background-color: #dcefdc; }
+.git-gui .state-deleted { background-color: #fbc4c4; }
+.git-gui .state-new { background-color: #fce1fc; }
+.git-gui .state-conflict { background-color: #fbc4c4; }
+.git-gui .diff-panel {
+  background-color: #fffdfb;
+  border: 1px solid #f0dfe3;
+  border-radius: 20px;
+  padding: 18px;
+}
+.git-gui .diff-text, .git-gui .diff-text text {
+  font-family: monospace;
+  font-size: 13px;
+  background-color: #fffdfb;
+  color: #0d2426;
+}
+.git-gui paned > separator { min-width: 6px; background-color: #f2dfe6; border-radius: 3px; }

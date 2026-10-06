@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from git.git_service import GitService, GitServiceError
+from git.git_service import MAX_DIFF_BYTES, MAX_DIFF_LINES, GitService, GitServiceError
 
 
 @unittest.skipUnless(shutil.which("git"), "Estas pruebas requieren Git instalado")
@@ -38,6 +38,11 @@ class GitServiceTests(unittest.TestCase):
         self.git("add", "--", "hola.txt")
         self.git("-c", "user.name=Prueba", "-c", "user.email=prueba@example.test",
                  "-c", "commit.gpgSign=false", "commit", "-m", "Primer commit")
+
+    def commit_all(self, message="Cambios de prueba", cwd=None):
+        self.git("add", "-A", cwd=cwd)
+        self.git("-c", "user.name=Prueba", "-c", "user.email=prueba@example.test",
+                 "-c", "commit.gpgSign=false", "commit", "-m", message, cwd=cwd)
 
     def test_inspection_does_not_initialize_a_folder(self):
         info = self.service.inspect_repository(self.folder)
@@ -168,6 +173,364 @@ class GitServiceTests(unittest.TestCase):
         with patch("git.git_service.subprocess.run", side_effect=subprocess.TimeoutExpired("git", 30)):
             with self.assertRaisesRegex(GitServiceError, "tardó demasiado"):
                 self.service.inspect_repository(self.folder)
+
+    def test_clean_repository_has_no_changes(self):
+        self.committed_repository()
+        info = self.service.inspect_repository(self.folder)
+        self.assertEqual(info.files, ())
+        self.assertFalse(info.can_stage_all)
+
+    def test_status_distinguishes_modified_deleted_added_and_untracked(self):
+        self.committed_repository()
+        (self.folder / "eliminado.txt").write_text("contenido", encoding="utf-8")
+        self.commit_all()
+        (self.folder / "eliminado.txt").unlink()
+        (self.folder / "hola.txt").write_text("editado", encoding="utf-8")
+        (self.folder / "nuevo.txt").write_text("nuevo", encoding="utf-8")
+        (self.folder / "preparado.txt").write_text("preparado", encoding="utf-8")
+        self.git("add", "--", "preparado.txt")
+        info = self.service.inspect_repository(self.folder)
+        codes = {file.path: (file.index_status, file.working_status) for file in info.files}
+        self.assertEqual(codes, {
+            "eliminado.txt": (".", "D"), "hola.txt": (".", "M"),
+            "nuevo.txt": (".", "?"), "preparado.txt": ("A", "."),
+        })
+        self.assertEqual([file.path for file in info.staged_files], ["preparado.txt"])
+        self.assertEqual(len(info.unstaged_files), 3)
+
+    def test_stage_and_unstage_modified_file_preserve_local_content(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.write_text("nueva versión\n", encoding="utf-8")
+        staged = self.service.stage_file(self.folder, "hola.txt")
+        self.assertEqual(len(staged.staged_files), 1)
+        self.assertEqual(staged.unstaged_files, ())
+        self.assertEqual(self.git("show", ":hola.txt"), "nueva versión")
+        unstaged = self.service.unstage_file(self.folder, "hola.txt")
+        self.assertEqual(unstaged.staged_files, ())
+        self.assertEqual(unstaged.unstaged_files[0].working_status, "M")
+        self.assertEqual(file.read_text(encoding="utf-8"), "nueva versión\n")
+        self.assertEqual(self.git("show", ":hola.txt"), "hola")
+
+    def test_partially_staged_file_is_in_both_groups_and_can_be_staged_again(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.write_text("primera edición", encoding="utf-8")
+        self.service.stage_file(self.folder, "hola.txt")
+        file.write_text("segunda edición", encoding="utf-8")
+        info = self.service.inspect_repository(self.folder)
+        self.assertEqual(info.files[0].index_status, "M")
+        self.assertEqual(info.files[0].working_status, "M")
+        self.assertEqual(info.staged_files, info.unstaged_files)
+        self.assertEqual(self.git("show", ":hola.txt"), "primera edición")
+        self.service.stage_file(self.folder, "hola.txt")
+        self.assertEqual(self.git("show", ":hola.txt"), "segunda edición")
+
+    def test_unstage_before_first_commit_preserves_newer_working_copy(self):
+        self.git("init")
+        file = self.folder / "hola.txt"
+        file.write_text("preparado", encoding="utf-8")
+        self.service.stage_file(self.folder, "hola.txt")
+        file.write_text("editado después", encoding="utf-8")
+        info = self.service.unstage_file(self.folder, "hola.txt")
+        self.assertEqual(info.staged_files, ())
+        self.assertEqual(info.unstaged_files[0].working_status, "?")
+        self.assertEqual(file.read_text(encoding="utf-8"), "editado después")
+        self.assertEqual(self.git("ls-files"), "")
+
+    def test_stage_and_unstage_deletion_does_not_recreate_file(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.unlink()
+        info = self.service.stage_file(self.folder, "hola.txt")
+        self.assertEqual(info.staged_files[0].index_status, "D")
+        info = self.service.unstage_file(self.folder, "hola.txt")
+        self.assertEqual(info.unstaged_files[0].working_status, "D")
+        self.assertFalse(file.exists())
+
+    def test_stage_all_includes_deletions_and_new_files_but_respects_gitignore(self):
+        self.committed_repository()
+        (self.folder / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+        self.commit_all()
+        (self.folder / "hola.txt").unlink()
+        nested = self.folder / "documentos"
+        nested.mkdir()
+        (nested / "nuevo.txt").write_text("nuevo", encoding="utf-8")
+        (self.folder / "ignorado.tmp").write_text("privado", encoding="utf-8")
+        info = self.service.stage_all(nested)
+        self.assertEqual(info.root_path, self.folder)
+        self.assertEqual(info.selected_path, nested)
+        self.assertEqual(info.unstaged_files, ())
+        self.assertEqual({file.path for file in info.staged_files}, {"documentos/nuevo.txt", "hola.txt"})
+        self.assertNotIn("ignorado.tmp", self.git("ls-files"))
+
+    def test_literal_file_names_are_staged_one_at_a_time(self):
+        self.git("init")
+        names = ["*.txt", "[archivo].txt", "-opción.txt", ":(glob)*", "dos\nlíneas.txt", "retorno\r.txt"]
+        for name in names:
+            (self.folder / name).write_text(name, encoding="utf-8")
+        for index, name in enumerate(names, start=1):
+            with self.subTest(name=name):
+                info = self.service.stage_file(self.folder, name)
+                self.assertEqual({file.path for file in info.staged_files}, set(names[:index]))
+        for name in names:
+            with self.subTest(name=name):
+                self.service.unstage_file(self.folder, name)
+                self.assertEqual((self.folder / name).read_bytes(), name.encode("utf-8"))
+
+    def test_filename_with_non_utf8_byte_can_be_staged(self):
+        self.git("init")
+        name = os.fsdecode(b"nombre-\xff.txt")
+        (self.folder / name).write_bytes(b"contenido")
+        info = self.service.stage_file(self.folder, name)
+        self.assertEqual(info.staged_files[0].path, name)
+        self.service.unstage_file(self.folder, name)
+        self.assertEqual((self.folder / name).read_bytes(), b"contenido")
+
+    def test_rename_unstage_restores_both_index_paths_and_keeps_working_rename(self):
+        self.committed_repository()
+        self.git("mv", "--", "hola.txt", "renombrado.txt")
+        info = self.service.inspect_repository(self.folder)
+        self.assertEqual(info.staged_files[0].index_status, "R")
+        self.assertEqual(info.staged_files[0].original_path, "hola.txt")
+        info = self.service.unstage_file(self.folder, "renombrado.txt")
+        self.assertEqual(info.staged_files, ())
+        self.assertEqual(self.git("ls-files"), "hola.txt")
+        self.assertFalse((self.folder / "hola.txt").exists())
+        self.assertEqual((self.folder / "renombrado.txt").read_text(encoding="utf-8"), "hola\n")
+
+    def test_already_staged_rename_can_prepare_later_edits(self):
+        self.committed_repository()
+        self.git("mv", "--", "hola.txt", "renombrado.txt")
+        (self.folder / "renombrado.txt").write_text("hola\nedición adicional\n", encoding="utf-8")
+        info = self.service.stage_file(self.folder, "renombrado.txt")
+        self.assertEqual(info.unstaged_files, ())
+        self.assertEqual(self.git("show", ":renombrado.txt"), "hola\nedición adicional")
+
+    def test_stale_or_outside_path_does_not_modify_index(self):
+        self.committed_repository()
+        before = self.git("ls-files", "--stage")
+        for name in ("hola.txt", "../afuera.txt", str(self.folder / "hola.txt")):
+            with self.subTest(name=name), self.assertRaises(GitServiceError):
+                self.service.stage_file(self.folder, name)
+        self.assertEqual(before, self.git("ls-files", "--stage"))
+
+    def test_index_lock_error_is_visible_and_preserves_working_file(self):
+        self.committed_repository()
+        (self.folder / "hola.txt").write_text("editado", encoding="utf-8")
+        (self.folder / ".git" / "index.lock").touch()
+        with self.assertRaises(GitServiceError) as error:
+            self.service.stage_file(self.folder, "hola.txt")
+        self.assertIn("index.lock", error.exception.details)
+        self.assertEqual((self.folder / "hola.txt").read_text(encoding="utf-8"), "editado")
+
+    def test_merge_conflicts_are_visible_and_not_treated_as_prepared(self):
+        self.committed_repository()
+        self.git("checkout", "-b", "otra")
+        (self.folder / "hola.txt").write_text("cambio de otra rama\n", encoding="utf-8")
+        self.commit_all()
+        self.git("checkout", "main")
+        (self.folder / "hola.txt").write_text("cambio de main\n", encoding="utf-8")
+        self.commit_all()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.git("-c", "user.name=Prueba", "-c", "user.email=prueba@example.test", "merge", "otra")
+        info = self.service.inspect_repository(self.folder)
+        self.assertTrue(info.unstaged_files[0].conflicted)
+        self.assertEqual(info.staged_files, ())
+        self.assertFalse(info.can_stage_all)
+        original = (self.folder / "hola.txt").read_bytes()
+        with self.assertRaises(GitServiceError):
+            self.service.stage_all(self.folder)
+        with self.assertRaises(GitServiceError):
+            self.service.stage_file(self.folder, "hola.txt")
+        self.assertEqual((self.folder / "hola.txt").read_bytes(), original)
+
+    def test_submodule_working_changes_are_identified_and_not_silently_staged(self):
+        self.committed_repository()
+        source = self.base / "origen"
+        source.mkdir()
+        self.git("init", cwd=source)
+        (source / "archivo.txt").write_text("contenido", encoding="utf-8")
+        self.commit_all(cwd=source)
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", str(source), "modulo")
+        self.commit_all()
+        (self.folder / "modulo" / "archivo.txt").write_text("modificado", encoding="utf-8")
+        info = self.service.inspect_repository(self.folder)
+        self.assertTrue(info.unstaged_files[0].submodule.startswith("S"))
+        self.assertFalse(info.can_stage_all)
+        with self.assertRaisesRegex(GitServiceError, "submódulos"):
+            self.service.stage_all(self.folder)
+
+    def test_root_with_carriage_return_is_preserved(self):
+        folder = self.base / "carpeta\rfinal"
+        folder.mkdir()
+        self.assertEqual(self.service.initialize_repository(folder).root_path, folder)
+
+    def test_unstaged_diff_shows_added_and_removed_lines_without_staging(self):
+        self.committed_repository()
+        (self.folder / "hola.txt").write_text("nueva línea\n", encoding="utf-8")
+        diff = self.service.get_diff(self.folder, "hola.txt")
+        self.assertIn("-hola\n", diff.text)
+        self.assertIn("+nueva línea\n", diff.text)
+        self.assertIn("@@", diff.text)
+        self.assertFalse(diff.staged)
+        self.assertFalse(diff.binary)
+        self.assertEqual(self.git("show", ":hola.txt"), "hola")
+
+    def test_staged_and_unstaged_diff_compare_the_correct_versions(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.write_text("primera edición\n", encoding="utf-8")
+        self.service.stage_file(self.folder, "hola.txt")
+        file.write_text("segunda edición\n", encoding="utf-8")
+        staged = self.service.get_diff(self.folder, "hola.txt", staged=True)
+        unstaged = self.service.get_diff(self.folder, "hola.txt")
+        self.assertIn("-hola\n", staged.text)
+        self.assertIn("+primera edición\n", staged.text)
+        self.assertNotIn("segunda edición", staged.text)
+        self.assertIn("-primera edición\n", unstaged.text)
+        self.assertIn("+segunda edición\n", unstaged.text)
+        self.assertEqual(self.git("show", ":hola.txt"), "primera edición")
+
+    def test_untracked_diff_uses_git_without_creating_an_index_entry(self):
+        self.git("init")
+        file = self.folder / "nuevo.txt"
+        file.write_text("hola\nsegunda línea\n", encoding="utf-8")
+        diff = self.service.get_diff(self.folder, "nuevo.txt")
+        self.assertIn("+segunda línea\n", diff.text)
+        self.assertIn("new file mode", diff.text)
+        self.assertEqual(self.git("ls-files"), "")
+        self.assertEqual(file.read_text(encoding="utf-8"), "hola\nsegunda línea\n")
+
+    def test_staged_new_file_diff_works_before_first_commit(self):
+        self.git("init")
+        (self.folder / "nuevo.txt").write_text("listo\n", encoding="utf-8")
+        self.service.stage_file(self.folder, "nuevo.txt")
+        diff = self.service.get_diff(self.folder, "nuevo.txt", staged=True)
+        self.assertTrue(diff.staged)
+        self.assertIn("+listo\n", diff.text)
+        self.assertIn("/dev/null", diff.text)
+
+    def test_deleted_file_diff_works_in_both_groups(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.unlink()
+        diff = self.service.get_diff(self.folder, "hola.txt")
+        self.assertIn("-hola\n", diff.text)
+        self.service.stage_file(self.folder, "hola.txt")
+        diff = self.service.get_diff(self.folder, "hola.txt", staged=True)
+        self.assertIn("deleted file mode", diff.text)
+        self.assertIn("-hola\n", diff.text)
+        self.assertFalse(file.exists())
+
+    def test_staged_rename_diff_includes_original_and_new_path(self):
+        self.committed_repository()
+        self.git("mv", "--", "hola.txt", "renombrado.txt")
+        diff = self.service.get_diff(self.folder, "renombrado.txt", staged=True)
+        self.assertIn("rename from hola.txt", diff.text)
+        self.assertIn("rename to renombrado.txt", diff.text)
+
+    def test_diff_reports_binary_files_for_new_and_staged_versions(self):
+        self.git("init")
+        (self.folder / "imagen.bin").write_bytes(b"\x00\xffcontenido\x00")
+        diff = self.service.get_diff(self.folder, "imagen.bin")
+        self.assertTrue(diff.binary)
+        self.assertIn("binario", diff.message)
+        self.service.stage_file(self.folder, "imagen.bin")
+        self.assertTrue(self.service.get_diff(self.folder, "imagen.bin", staged=True).binary)
+
+    def test_tracked_binary_diff_is_identified(self):
+        self.committed_repository()
+        (self.folder / "hola.txt").write_bytes(b"\x00datos binarios")
+        self.assertTrue(self.service.get_diff(self.folder, "hola.txt").binary)
+
+    def test_large_diff_is_limited_in_bytes_and_does_not_modify_file(self):
+        self.git("init")
+        data = b"x" * (MAX_DIFF_BYTES * 2)
+        file = self.folder / "grande.txt"
+        file.write_bytes(data)
+        diff = self.service.get_diff(self.folder, "grande.txt")
+        self.assertTrue(diff.truncated)
+        self.assertLessEqual(len(diff.text.encode("utf-8")), MAX_DIFF_BYTES)
+        self.assertEqual(file.read_bytes(), data)
+        self.assertEqual(self.git("ls-files"), "")
+
+    def test_large_diff_is_limited_in_lines(self):
+        self.git("init")
+        (self.folder / "lineas.txt").write_text("una línea\n" * (MAX_DIFF_LINES + 100), encoding="utf-8")
+        diff = self.service.get_diff(self.folder, "lineas.txt")
+        self.assertTrue(diff.truncated)
+        self.assertLessEqual(diff.text.count("\n"), MAX_DIFF_LINES)
+
+    def test_diff_handles_empty_files_and_missing_final_newline(self):
+        self.git("init")
+        (self.folder / "vacio.txt").touch()
+        (self.folder / "sin-salto.txt").write_text("sin salto", encoding="utf-8")
+        self.assertIn("new file mode", self.service.get_diff(self.folder, "vacio.txt").text)
+        self.assertIn("No newline at end of file", self.service.get_diff(self.folder, "sin-salto.txt").text)
+
+    def test_diff_paths_are_literal_and_accept_special_names(self):
+        self.git("init")
+        for name in ("*.txt", "-archivo.txt", "nombre\ncon salto.txt", os.fsdecode(b"nombre-\xff.txt")):
+            (self.folder / name).write_text("mi contenido\n", encoding="utf-8")
+            with self.subTest(name=name):
+                diff = self.service.get_diff(self.folder, name)
+                self.assertEqual(diff.path, name)
+                self.assertIn("+mi contenido\n", diff.text)
+
+    def test_diff_does_not_run_external_diff_or_textconv(self):
+        self.committed_repository()
+        marker = self.folder / "CONVERSOR_EJECUTADO"
+        converter = self.base / "converter.sh"
+        converter.write_text("#!/bin/sh\ntouch CONVERSOR_EJECUTADO\nprintf convertido\n", encoding="utf-8")
+        converter.chmod(0o700)
+        (self.folder / ".gitattributes").write_text("hola.txt diff=custom\n", encoding="utf-8")
+        self.git("config", "diff.custom.textconv", str(converter))
+        (self.folder / "hola.txt").write_text("texto nuevo\n", encoding="utf-8")
+        with patch.dict(os.environ, {"GIT_EXTERNAL_DIFF": str(converter)}):
+            diff = self.service.get_diff(self.folder, "hola.txt")
+        self.assertIn("+texto nuevo\n", diff.text)
+        self.assertFalse(marker.exists())
+
+    def test_diff_rejects_stale_group_or_outside_path(self):
+        self.committed_repository()
+        (self.folder / "hola.txt").write_text("editado", encoding="utf-8")
+        with self.assertRaisesRegex(GitServiceError, "versión"):
+            self.service.get_diff(self.folder, "hola.txt", staged=True)
+        with self.assertRaises(GitServiceError):
+            self.service.get_diff(self.folder, "../afuera.txt")
+
+    def test_diff_of_untracked_symlink_shows_target_without_reading_its_contents(self):
+        self.git("init")
+        outside = self.base / "afuera.txt"
+        outside.write_text("contenido externo privado", encoding="utf-8")
+        (self.folder / "enlace").symlink_to(outside)
+        diff = self.service.get_diff(self.folder, "enlace")
+        self.assertIn(str(outside), diff.text)
+        self.assertNotIn("contenido externo privado", diff.text)
+
+    def test_diff_of_file_mode_change_is_visible(self):
+        self.committed_repository()
+        (self.folder / "hola.txt").chmod(0o755)
+        diff = self.service.get_diff(self.folder, "hola.txt")
+        self.assertIn("old mode 100644", diff.text)
+        self.assertIn("new mode 100755", diff.text)
+
+    def test_untracked_diff_does_not_hide_git_errors_with_exit_code_one(self):
+        self.git("init")
+        file = self.folder / "nuevo.txt"
+        file.write_text("contenido", encoding="utf-8")
+        original_run = self.service._run
+
+        def remove_before_diff(arguments, **kwargs):
+            if arguments[0] == "diff":
+                file.unlink()
+            return original_run(arguments, **kwargs)
+
+        with patch.object(self.service, "_run", side_effect=remove_before_diff):
+            with self.assertRaises(GitServiceError) as error:
+                self.service.get_diff(self.folder, "nuevo.txt")
+        self.assertIn("Could not access", error.exception.details)
 
 
 if __name__ == "__main__":
