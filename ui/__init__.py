@@ -1,0 +1,1 @@
+"""Interfaz nativa GTK4."""

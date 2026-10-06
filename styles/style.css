@@ -1,0 +1,72 @@
+.git-gui {
+  font-family: "Quicksand", sans-serif;
+  font-size: 15px;
+  color: #0d2426;
+  background-color: #fff9f8;
+}
+
+.git-gui headerbar {
+  background-color: #fff1f3;
+  border-bottom: 1px solid #f4dedf;
+  padding: 10px 14px;
+  box-shadow: none;
+}
+
+.git-gui headerbar label { color: #0d2426; }
+.git-gui windowcontrols button {
+  padding: 0;
+  margin: 0 2px;
+  min-width: 32px;
+  min-height: 32px;
+  border: none;
+  border-radius: 50%;
+  background-color: transparent;
+}
+.git-gui windowcontrols button image { -gtk-icon-size: 16px; color: #0d2426; }
+
+.git-gui button {
+  border-radius: 14px;
+  padding: 10px 16px;
+  background-image: none;
+  background-color: #fffdfb;
+  border: 1px solid #ecd7dc;
+  color: #0d2426;
+  box-shadow: none;
+  font-weight: 600;
+}
+
+.git-gui button:hover { background-color: #fce1fc; }
+.git-gui button:active { background-color: #fbc4c4; }
+.git-gui button:disabled { opacity: 0.45; }
+.git-gui button:focus-visible { outline: 2px solid #727259; outline-offset: 3px; }
+.git-gui .primary-button { background-color: #fbc4c4; border-color: #edb2b6; }
+.git-gui .primary-button:hover { background-color: #f5b4bd; }
+.git-gui .app-title { font-size: 20px; font-weight: 700; }
+.git-gui .hero-title { font-size: 28px; font-weight: 700; }
+.git-gui .section-title { font-size: 18px; font-weight: 700; }
+.git-gui .secondary { color: #727259; }
+.git-gui .eyebrow { font-size: 12px; font-weight: 700; color: #727259; }
+.git-gui .branch-badge {
+  background-color: #fce1fc;
+  border-radius: 12px;
+  padding: 8px 14px;
+}
+.git-gui .card {
+  background-color: #fffdfb;
+  border: 1px solid #f0dfe3;
+  border-radius: 24px;
+  padding: 30px;
+}
+.git-gui .notice {
+  background-color: #fff5d8;
+  border-radius: 14px;
+  padding: 14px 18px;
+}
+.git-gui .status-bar {
+  background-color: #fff1f3;
+  border-top: 1px solid #f4dedf;
+  padding: 14px 22px;
+}
+.git-gui .status-error { color: #823746; }
+.git-gui textview, .git-gui textview text { background-color: #fff9f8; color: #0d2426; }
+.git-gui scrollbar slider { min-width: 8px; min-height: 8px; }

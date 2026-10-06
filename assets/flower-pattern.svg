@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="140" viewBox="0 0 700 140">
+  <defs>
+    <g id="flower">
+      <g fill="#fbc4c4">
+        <ellipse cy="-9" rx="5" ry="8"/>
+        <ellipse cy="-9" rx="5" ry="8" transform="rotate(72)"/>
+        <ellipse cy="-9" rx="5" ry="8" transform="rotate(144)"/>
+        <ellipse cy="-9" rx="5" ry="8" transform="rotate(216)"/>
+        <ellipse cy="-9" rx="5" ry="8" transform="rotate(288)"/>
+      </g>
+      <circle r="4" fill="#fbe29b"/>
+    </g>
+    <pattern id="garden" width="140" height="110" patternUnits="userSpaceOnUse">
+      <use href="#flower" transform="translate(30 32) scale(.75)" opacity=".65"/>
+      <use href="#flower" transform="translate(100 86) rotate(25) scale(.6)" opacity=".5"/>
+      <ellipse cx="91" cy="36" rx="3" ry="6" fill="#fce1fc" transform="rotate(30 91 36)"/>
+    </pattern>
+  </defs>
+  <rect width="700" height="140" fill="url(#garden)"/>
+</svg>
