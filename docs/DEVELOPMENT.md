@@ -205,15 +205,15 @@ El resultado se guarda en `dist/` junto con un archivo SHA-256. El paquete decla
 `Architecture: all`: contiene código Python y recursos independientes de la arquitectura.
 Debian instala las dependencias para la arquitectura del equipo.
 
-La versión inicial es `0.1.0-1`. Para cambiarla y completar el nombre y correo del
-mantenedor al compartir el paquete:
+La versión inicial es `0.1.0-1`. Para generar otra versión:
 
 ```bash
-/usr/bin/python3 packaging/build_deb.py --version 0.1.1-1 --maintainer "Nombre <correo@example.com>"
+/usr/bin/python3 packaging/build_deb.py --version 0.1.1-1
 ```
 
-El mantenedor predeterminado es un marcador del proyecto con una dirección
-`example.invalid`; reemplazarlo por los datos deseados antes de publicar versiones.
+La mantenedora predeterminada es `Mina (Lakhezis) <silvina@tocci.ar>`.
+Para construir un paquete con otros datos, utilizar la opción
+`--maintainer "Nombre <correo@example.com>"`.
 Los archivos generados no se guardan en Git. El constructor admite `SOURCE_DATE_EPOCH`
 y normaliza fechas, permisos y propietarios para generar paquetes reproducibles.
 No incluye instaladores que se ejecuten como root, hooks Git ni scripts de mantenimiento.
@@ -226,7 +226,8 @@ y [campos de control de Debian](https://www.debian.org/doc/debian-policy/ch-cont
 1. Ejecutar las pruebas correspondientes y revisar los cambios.
 2. Generar el paquete con la versión y los datos del mantenedor de la publicación.
 3. Crear una etiqueta Git que identifique el código utilizado para construirlo.
-4. Crear una publicación en **Releases** con sus notas de versión y adjuntar
+4. Crear una publicación en [Releases](https://github.com/Lakhezis/gixsiepy/releases)
+   con sus notas de versión y adjuntar
    el archivo `.deb` y su archivo `.deb.sha256` generado en `dist/`.
 
 Los binarios se adjuntan a la publicación; `dist/` permanece excluido del repositorio.

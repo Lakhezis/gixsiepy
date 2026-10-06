@@ -19,7 +19,7 @@ import tempfile
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 APP_ID = "org.gixsie.GixsiePy"
 DEFAULT_VERSION = "0.1.0-1"
-DEFAULT_MAINTAINER = "GixsiePy contributors <maintainers@example.invalid>"
+DEFAULT_MAINTAINER = "Mina (Lakhezis) <silvina@tocci.ar>"
 
 
 def copy_file(source, target, mode=0o644):

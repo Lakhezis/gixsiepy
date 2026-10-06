@@ -49,7 +49,8 @@ sans-serif, con Quicksand como opción preferida.
 ### Paquete Debian (.deb)
 
 Para instalar una versión publicada, descargar el archivo `.deb` desde la sección
-**Releases** del repositorio en GitHub. El archivo `.deb.sha256` permite verificar
+[Releases](https://github.com/Lakhezis/gixsiepy/releases) del repositorio en GitHub.
+El archivo `.deb.sha256` permite verificar
 la integridad de la descarga.
 
 Desde la carpeta donde se descargaron los archivos, ejecutar estos comandos
@@ -106,14 +107,22 @@ Cuando no está disponible, se utiliza una fuente sans-serif del sistema.
 
 ## Ejecutar desde el código fuente
 
-El código se puede obtener desde la pestaña **Code** del repositorio en GitHub,
-clonando el repositorio o descargando y extrayendo su archivo ZIP.
+El código está disponible en el [repositorio de GitHub](https://github.com/Lakhezis/gixsiepy).
+Se puede clonar el repositorio o descargar y extraer el
+[archivo ZIP de la rama master](https://github.com/Lakhezis/gixsiepy/archive/refs/heads/master.zip).
 
 Instalar las dependencias en Debian 13:
 
 ```bash
 sudo apt update
 sudo apt install python3 python3-gi gir1.2-gtk-4.0 git
+```
+
+Para obtener el código mediante Git:
+
+```bash
+git clone https://github.com/Lakhezis/gixsiepy.git
+cd gixsiepy
 ```
 
 Desde la carpeta del código fuente, ejecutar:
@@ -170,11 +179,13 @@ La aplicación no ofrece `reset --hard`, `clean` ni force push.
 ## Contribuir
 
 Se reciben reportes de errores, propuestas de mejoras, cambios de documentación
-y contribuciones de código a través del repositorio en GitHub.
+y contribuciones de código a través del
+[repositorio en GitHub](https://github.com/Lakhezis/gixsiepy).
 
 ### Reportar un problema
 
-Antes de abrir un **issue**, comprobar si el problema ya fue reportado. Incluir:
+Antes de abrir un [issue](https://github.com/Lakhezis/gixsiepy/issues), comprobar
+si el problema ya fue reportado. Incluir:
 
 - Versión de GixsiePy, distribución y versión de Git.
 - Método de instalación: `.deb`, código fuente o instalador de usuario.
@@ -190,7 +201,8 @@ Los cambios deben conservar la separación entre la interfaz y `GitService`, man
 el código sencillo y explicar cualquier dependencia nueva. Para cambios importantes,
 abrir primero un issue para discutir su alcance.
 
-Las pull requests deben describir el problema, el cambio propuesto y su validación.
+Las [pull requests](https://github.com/Lakhezis/gixsiepy/pulls) deben describir
+el problema, el cambio propuesto y su validación.
 Las pruebas se ejecutan desde la carpeta del proyecto:
 
 ```bash
