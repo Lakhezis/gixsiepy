@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Pull y push reales contra repositorios bare locales; no requieren Internet."""
 
 import os

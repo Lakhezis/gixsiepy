@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Un trabajador para Git; todos los callbacks de UI vuelven al hilo principal."""
 
 from concurrent.futures import ThreadPoolExecutor

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Desktop Entry]
+Type=Application
+Name=GixsiePy
+GenericName=Git client
+GenericName[es]=Cliente de Git
+Comment=Git at your own pace
+Comment[es]=Git a tu ritmo
+Exec=@EXEC@
+Icon=org.gixsie.GixsiePy
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.gixsie.GixsiePy
+Categories=Development;RevisionControl;
+Keywords=Git;commit;diff;repository;
+Keywords[es]=Git;commit;diff;repositorio;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Confirmaciones explícitas y errores con detalles consultables."""
 
 from gi.repository import GLib, Gtk

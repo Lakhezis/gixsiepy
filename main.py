@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Entrada de la aplicación. Ejecutar con /usr/bin/python3 main.py."""
 
 from pathlib import Path
@@ -21,6 +24,7 @@ from ui.window import MainWindow
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+APPLICATION_ID = "org.gixsie.GixsiePy"
 
 
 def load_styles(display):
@@ -32,9 +36,14 @@ def load_styles(display):
     return provider
 
 
+def load_icons(display):
+    Gtk.IconTheme.get_for_display(display).add_search_path(str(PROJECT_DIR / "assets"))
+    Gtk.Window.set_default_icon_name(APPLICATION_ID)
+
+
 class GitGuiApplication(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="org.gixsie.GixsiePy")
+        super().__init__(application_id=APPLICATION_ID)
         self.window = None
 
     def do_activate(self):
@@ -44,6 +53,7 @@ class GitGuiApplication(Gtk.Application):
                 self.quit()
                 return
             self.css_provider = load_styles(Gdk.Display.get_default())
+            load_icons(Gdk.Display.get_default())
             self.window = MainWindow(self, PROJECT_DIR)
             self.window.connect("destroy", self._window_destroyed)
         self.window.present()

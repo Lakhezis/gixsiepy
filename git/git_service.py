@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Operaciones Git mediante el ejecutable instalado en el sistema."""
 
 from dataclasses import dataclass, field

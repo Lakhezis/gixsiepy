@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Lista de commits recientes; solo representa los datos de GitService."""
 
 from gi.repository import Gtk, Pango

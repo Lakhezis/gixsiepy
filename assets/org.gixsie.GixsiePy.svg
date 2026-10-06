@@ -1,0 +1,19 @@
+<!--
+SPDX-FileCopyrightText: 2026 GixsiePy contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>GixsiePy: una flor y una rama Git</title>
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="#fce1fc"/>
+  <path d="M54 100V68M54 88C54 72 88 83 88 61" fill="none" stroke="#0d2426" stroke-width="7" stroke-linecap="round"/>
+  <g transform="translate(54 48)" fill="#fbc4c4">
+    <ellipse cy="-15" rx="11" ry="18"/>
+    <ellipse cy="-15" rx="11" ry="18" transform="rotate(72)"/>
+    <ellipse cy="-15" rx="11" ry="18" transform="rotate(144)"/>
+    <ellipse cy="-15" rx="11" ry="18" transform="rotate(216)"/>
+    <ellipse cy="-15" rx="11" ry="18" transform="rotate(288)"/>
+    <circle r="11" fill="#fbe29b"/>
+  </g>
+  <circle cx="88" cy="59" r="9" fill="#fbe29b" stroke="#0d2426" stroke-width="5"/>
+  <circle cx="54" cy="100" r="9" fill="#fbc4c4" stroke="#0d2426" stroke-width="5"/>
+</svg>

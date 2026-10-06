@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Visor de parches Git con resaltado de líneas y selección de texto."""
 
 from gi.repository import Gtk, Pango

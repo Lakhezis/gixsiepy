@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Listas de archivos y acciones de staging, sin ejecutar comandos Git."""
 
 from gi.repository import Gtk, Pango

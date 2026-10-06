@@ -1,0 +1,13 @@
+Package: gixsiepy
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: all
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0 (>= 4.10), git
+Suggests: fonts-quicksand
+Description: friendly native GTK4 interface for Git
+ Open repositories, inspect changes, stage files, create commits, synchronize
+ with a remote and browse recent history using the Git installed on the system.
+ GixsiePy is written in Python and provides a soft, clear desktop interface.

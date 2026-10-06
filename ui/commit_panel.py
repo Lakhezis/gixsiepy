@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 GixsiePy contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Mensaje y validación visual del commit, sin ejecutar Git."""
 
 from gi.repository import Gtk
