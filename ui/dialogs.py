@@ -25,6 +25,27 @@ def confirm_detached_commit(parent, on_confirm, on_cancel):
     )
 
 
+def confirm_sync(parent, plan, on_confirm, on_cancel):
+    if plan.operation == "pull":
+        message = "¿Traer cambios del remoto (Pull)?"
+        detail = (
+            f"Desde: {plan.destination}\nRama local: {plan.local_branch}\n\n"
+            "Se actualizarán los archivos y la rama mediante avance rápido. "
+            "Si los historiales divergen, Git detendrá la operación."
+        )
+        accept = "Hacer Pull"
+    else:
+        message = "¿Enviar commits al remoto (Push)?"
+        detail = (
+            f"Rama local: {plan.local_branch}\nDestino: {plan.destination}\n\n"
+            "Se publicarán los commits de esta rama, que podrían quedar visibles para otras personas."
+        )
+        if plan.set_upstream:
+            detail += "\n\nEste primer Push establecerá el seguimiento (upstream) de la rama."
+        accept = "Hacer Push"
+    _confirm(parent, message, detail, accept, on_confirm, on_cancel)
+
+
 def _confirm(parent, message, detail, accept_label, on_confirm, on_cancel):
     dialog = Gtk.AlertDialog(
         message=message, detail=detail, buttons=["Cancelar", accept_label],
@@ -44,16 +65,23 @@ def _confirm(parent, message, detail, accept_label, on_confirm, on_cancel):
     dialog.choose(parent, None, finished)
 
 
-def show_error(parent, message, details=""):
-    dialog = Gtk.Window(title="No se pudo completar la acción", transient_for=parent, modal=True)
+def show_output(parent, details):
+    show_error(
+        parent, "La operación se completó. Esta es la salida original de Git.", details,
+        title="Resultado de Git", heading="Detalles de la operación",
+    )
+
+
+def show_error(parent, message, details="", *, title="No se pudo completar la acción", heading="Revisemos qué pasó"):
+    dialog = Gtk.Window(title=title, transient_for=parent, modal=True)
     dialog.set_default_size(510, 220)
     dialog.add_css_class("git-gui")
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
     for side in ("top", "bottom", "start", "end"):
         getattr(box, f"set_margin_{side}")(24)
-    title = Gtk.Label(label="Revisemos qué pasó", xalign=0)
-    title.add_css_class("section-title")
-    box.append(title)
+    heading_label = Gtk.Label(label=heading, xalign=0)
+    heading_label.add_css_class("section-title")
+    box.append(heading_label)
     label = Gtk.Label(label=message, wrap=True, xalign=0, selectable=True)
     label.set_max_width_chars(65)
     box.append(label)

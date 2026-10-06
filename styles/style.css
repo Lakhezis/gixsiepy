@@ -114,3 +114,15 @@
   padding: 16px 18px;
 }
 .git-gui .commit-message { border: 1px solid #ecd7dc; border-radius: 12px; }
+.git-gui .view-switcher button:checked { background-color: #fce1fc; border-color: #e4c9e8; }
+.git-gui .history-panel {
+  background-color: #fffdfb;
+  border: 1px solid #f0dfe3;
+  border-radius: 20px;
+  padding: 20px;
+}
+.git-gui .history-list { background-color: transparent; }
+.git-gui .history-list row { padding: 16px; border-bottom: 1px solid #f0dfe3; color: #0d2426; }
+.git-gui .history-list row:last-child { border-bottom: none; }
+.git-gui .commit-title { font-size: 16px; font-weight: 600; }
+.git-gui .commit-hash { background-color: #fff0c4; border-radius: 10px; padding: 5px 10px; }

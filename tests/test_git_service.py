@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from git.git_service import MAX_DIFF_BYTES, MAX_DIFF_LINES, GitService, GitServiceError
+from git.git_service import HISTORY_LIMIT, MAX_DIFF_BYTES, MAX_DIFF_LINES, GitService, GitServiceError
 
 
 @unittest.skipUnless(shutil.which("git"), "Estas pruebas requieren Git instalado")
@@ -655,6 +655,132 @@ class GitServiceTests(unittest.TestCase):
             self.service.commit(self.folder, "Bloqueado")
         self.assertIn("index.lock", error.exception.details)
         self.assertFalse(self.service.inspect_repository(self.folder).has_commits)
+
+    def test_history_of_new_repository_is_empty_without_running_log(self):
+        self.git("init")
+        with patch.object(self.service, "_run", wraps=self.service._run) as run:
+            self.assertEqual(self.service.get_history(self.folder), ())
+        self.assertFalse(any(call.args[0][0] == "log" for call in run.call_args_list))
+
+    def test_history_reads_subject_author_hash_and_author_date_with_timezone(self):
+        self.prepare_commit()
+        self.git("config", "user.name", "Ana | Jardín 🌸")
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_DATE": "2025-06-01T15:30:00-03:00",
+            "GIT_COMMITTER_DATE": "2025-06-02T12:00:00+00:00",
+        }):
+            self.service.commit(self.folder, "Flores | rosas\t🌸\n\nExplicación del cambio")
+        history = self.service.get_history(self.folder)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].message, "Flores | rosas\t🌸")
+        self.assertEqual(history[0].author, "Ana | Jardín 🌸")
+        self.assertEqual(history[0].short_hash, self.git("rev-parse", "--short=7", "HEAD"))
+        self.assertEqual(history[0].authored_at.isoformat(), "2025-06-01T15:30:00-03:00")
+
+    def test_history_returns_only_fifty_latest_commits(self):
+        self.prepare_commit()
+        self.service.commit(self.folder, "Inicial")
+        for index in range(HISTORY_LIMIT + 2):
+            self.git("commit", "--allow-empty", "-m", f"Commit {index}")
+        history = self.service.get_history(self.folder)
+        self.assertEqual(len(history), HISTORY_LIMIT)
+        self.assertEqual(history[0].message, f"Commit {HISTORY_LIMIT + 1}")
+        self.assertEqual(history[-1].message, "Commit 2")
+        self.assertEqual([commit.short_hash for commit in history],
+                         self.git("log", "-50", "--abbrev=7", "--format=%h").splitlines())
+
+    def test_history_follows_current_branch_and_detached_head(self):
+        self.committed_repository()
+        original = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-b", "otra")
+        (self.folder / "nuevo.txt").write_text("otra rama", encoding="utf-8")
+        self.commit_all("Solo en otra rama")
+        self.assertEqual(len(self.service.get_history(self.folder)), 2)
+        self.git("checkout", "main")
+        self.assertEqual([commit.message for commit in self.service.get_history(self.folder)], ["Primer commit"])
+        self.git("checkout", "--detach", original)
+        self.assertEqual([commit.message for commit in self.service.get_history(self.folder)], ["Primer commit"])
+
+    def test_history_includes_merge_and_both_parent_histories(self):
+        self.prepare_commit()
+        self.service.commit(self.folder, "Inicial")
+        self.git("checkout", "-b", "otra")
+        (self.folder / "otra.txt").write_text("otro archivo", encoding="utf-8")
+        self.commit_all("Desde otra rama")
+        self.git("checkout", "main")
+        (self.folder / "main.txt").write_text("main", encoding="utf-8")
+        self.commit_all("Desde main")
+        self.git("merge", "--no-ff", "otra", "-m", "Unir ramas")
+        history = self.service.get_history(self.folder)
+        self.assertEqual(history[0].message, "Unir ramas")
+        self.assertEqual({commit.message for commit in history}, {"Inicial", "Desde main", "Desde otra rama", "Unir ramas"})
+
+    def test_history_reads_whole_repository_from_subfolder_and_worktree(self):
+        self.committed_repository()
+        nested = self.folder / "subcarpeta"
+        nested.mkdir()
+        self.assertEqual(self.service.get_history(nested), self.service.get_history(self.folder))
+        worktree = self.base / "otra carpeta"
+        self.git("worktree", "add", "-b", "otra", str(worktree))
+        self.assertEqual(self.service.get_history(worktree), self.service.get_history(self.folder))
+
+    def test_history_read_preserves_index_and_unstaged_working_content(self):
+        self.committed_repository()
+        file = self.folder / "hola.txt"
+        file.write_text("preparado", encoding="utf-8")
+        self.service.stage_file(self.folder, "hola.txt")
+        file.write_text("posterior", encoding="utf-8")
+        before = (self.folder / ".git" / "index").read_bytes()
+        self.service.get_history(self.folder)
+        self.assertEqual((self.folder / ".git" / "index").read_bytes(), before)
+        self.assertEqual(file.read_text(encoding="utf-8"), "posterior")
+
+    def test_history_ignores_custom_pretty_colors_notes_and_output_encoding(self):
+        self.prepare_commit()
+        self.service.commit(self.folder, "Jardín 🌸")
+        self.git("notes", "add", "-m", "Una nota fuera del historial")
+        self.git("config", "format.pretty", "raw")
+        self.git("config", "color.ui", "always")
+        self.git("config", "log.showSignature", "true")
+        self.git("config", "notes.displayRef", "refs/notes/commits")
+        self.git("config", "i18n.logOutputEncoding", "ISO-8859-1")
+        history = self.service.get_history(self.folder)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].message, "Jardín 🌸")
+        self.assertEqual(history[0].author, "Prueba")
+
+    def test_history_rejects_non_repository_without_initializing_it(self):
+        with self.assertRaisesRegex(GitServiceError, "repositorio"):
+            self.service.get_history(self.folder)
+        self.assertFalse((self.folder / ".git").exists())
+
+    def test_history_error_preserves_original_git_output(self):
+        self.committed_repository()
+        original_run = self.service._run
+
+        def fail_log(arguments, **kwargs):
+            if arguments[0] == "log":
+                raise GitServiceError("Git falló", command=("git", "log"), stderr="fatal: bad object HEAD", returncode=128)
+            return original_run(arguments, **kwargs)
+
+        with patch.object(self.service, "_run", side_effect=fail_log):
+            with self.assertRaises(GitServiceError) as error:
+                self.service.get_history(self.folder)
+        self.assertIn("bad object HEAD", error.exception.details)
+
+    def test_malformed_history_output_has_explanation_and_raw_details(self):
+        self.committed_repository()
+        original_run = self.service._run
+        for output in ("abc1234\0sin campos\0", "hash-inválido\x00mensaje\x00autor\x002025-06-01T12:00:00+00:00\x00",
+                       "abc1234\0mensaje\0autor\0fecha-inválida\0"):
+            def invalid_log(arguments, **kwargs):
+                if arguments[0] == "log":
+                    return subprocess.CompletedProcess(["git", "log"], 0, stdout=output, stderr="")
+                return original_run(arguments, **kwargs)
+            with self.subTest(output=output), patch.object(self.service, "_run", side_effect=invalid_log):
+                with self.assertRaisesRegex(GitServiceError, "interpretar el historial") as error:
+                    self.service.get_history(self.folder)
+                self.assertEqual(error.exception.stdout, output)
 
 
 if __name__ == "__main__":

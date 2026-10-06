@@ -6,10 +6,11 @@ import traceback
 from gi.repository import Gio, GLib, Gtk, Pango
 
 from git.git_service import GitService, GitServiceError
-from ui.dialogs import confirm_detached_commit, confirm_initialization, show_error
+from ui.dialogs import confirm_detached_commit, confirm_initialization, confirm_sync, show_error, show_output
 from ui.commit_panel import CommitPanel
 from ui.diff_panel import DiffPanel
 from ui.files_panel import FilesPanel, STATUS_NAMES, display_path, display_text
+from ui.history_panel import HistoryPanel
 from ui.tasks import TaskRunner
 
 
@@ -24,6 +25,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.diff_tasks = TaskRunner()
         self._diff_generation = 0
         self._pending_diff = None
+        self._history_generation = 0
+        self._pending_history = None
+        self._history_loaded = False
+        self._last_sync = None
         self.repository = None
         self._dialog_pending = False
         self._closed = False
@@ -40,6 +45,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.refresh_button = Gtk.Button(label="↻ Actualizar", sensitive=False)
         self.refresh_button.connect("clicked", self._refresh)
         header.pack_end(self.refresh_button)
+        self.push_button = Gtk.Button(label="↑ Push", sensitive=False)
+        self.push_button.connect("clicked", lambda _button: self._sync("push"))
+        header.pack_end(self.push_button)
+        self.pull_button = Gtk.Button(label="↓ Pull", sensitive=False)
+        self.pull_button.connect("clicked", lambda _button: self._sync("pull"))
+        header.pack_end(self.pull_button)
         self.set_titlebar(header)
 
         layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -77,6 +88,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.welcome_open_button.connect("clicked", self._choose_folder)
         welcome.append(self.welcome_open_button)
         self.stack.add_named(welcome, "welcome")
+        self.views = Gtk.Stack(vexpand=True)
+        self.views.set_vhomogeneous(False)
+        self.views.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.view_switcher = Gtk.StackSwitcher(stack=self.views, valign=Gtk.Align.CENTER)
+        self.view_switcher.add_css_class("view-switcher")
+        self.view_switcher.set_visible(False)
 
         repo_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20, valign=Gtk.Align.CENTER)
         self.repo_card = repo_card
@@ -90,10 +107,16 @@ class MainWindow(Gtk.ApplicationWindow):
         repository_heading = Gtk.Box(spacing=20)
         self.name_label.set_hexpand(True)
         repository_heading.append(self.name_label)
+        repository_heading.append(self.view_switcher)
         repo_card.append(repository_heading)
-        self.path_label = Gtk.Label(xalign=0, selectable=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.path_label = Gtk.Label(xalign=0, selectable=True, ellipsize=Pango.EllipsizeMode.MIDDLE, hexpand=True)
         self.path_label.add_css_class("secondary")
-        repo_card.append(self.path_label)
+        location = Gtk.Box(spacing=16)
+        location.append(self.path_label)
+        self.remote_label = Gtk.Label(xalign=1, ellipsize=Pango.EllipsizeMode.END)
+        self.remote_label.add_css_class("secondary")
+        location.append(self.remote_label)
+        repo_card.append(location)
         self.branch_label = Gtk.Label(xalign=0, wrap=True, halign=Gtk.Align.START)
         self.branch_label.add_css_class("branch-badge")
         repository_heading.append(self.branch_label)
@@ -128,8 +151,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.workspace.set_resize_start_child(False)
         self.workspace.set_shrink_start_child(False)
         self.workspace.set_shrink_end_child(False)
-        self.workspace.set_visible(False)
-        content.append(self.workspace)
+        self.views.add_titled(self.workspace, "changes", "Cambios")
+        self.history_panel = HistoryPanel(on_details=self._show_failure)
+        self.views.add_titled(self.history_panel, "history", "Historial")
+        self.views.set_visible(False)
+        self.views.connect("notify::visible-child-name", self._view_changed)
+        content.append(self.views)
         scroll.set_child(content)
         layout.append(scroll)
 
@@ -139,6 +166,9 @@ class MainWindow(Gtk.ApplicationWindow):
         status.append(self.spinner)
         self.status_label = Gtk.Label(label="Elegí una carpeta para comenzar.", xalign=0, wrap=True, hexpand=True)
         status.append(self.status_label)
+        self.sync_details_button = Gtk.Button(label="Detalles de Git", visible=False)
+        self.sync_details_button.connect("clicked", self._show_sync_output)
+        status.append(self.sync_details_button)
         layout.append(status)
         self.set_child(layout)
         self._update_actions()
@@ -163,6 +193,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self.spinner.set_spinning(self.tasks.busy)
         self.files_panel.set_blocked(blocked)
         self.commit_panel.set_blocked(blocked)
+        for button, problem, help_text in (
+            (self.pull_button, self.repository.pull_problem if self.repository else "Abrí un repositorio.",
+             "Traer cambios de la rama de seguimiento mediante avance rápido."),
+            (self.push_button, self.repository.sync_problem if self.repository else "Abrí un repositorio.",
+             "Enviar los commits de la rama actual al remoto."),
+        ):
+            button.set_sensitive(not blocked and problem is None)
+            button.set_tooltip_text(display_text(problem or help_text))
         self._start_pending_diff()
 
     def _choose_folder(self, _button):
@@ -219,13 +257,19 @@ class MainWindow(Gtk.ApplicationWindow):
                 on_error(error)
             else:
                 self._show_failure(error)
+                if self.views.get_visible_child_name() == "history":
+                    self._request_history()
 
         if self.tasks.submit(operation, succeeded, failed):
+            self._last_sync = None
+            self.sync_details_button.set_visible(False)
             self._invalidate_diff("Actualizando el repositorio…")
+            self._invalidate_history("Actualizando el repositorio…")
             self._set_status(message)
             self._update_actions()
 
     def _repository_loaded(self, info, initialized=False):
+        previous_root = self.repository.root_path if self.repository else None
         self.repository = info
         self.name_label.set_text(display_text(info.name))
         path = info.root_path or info.selected_path
@@ -243,8 +287,22 @@ class MainWindow(Gtk.ApplicationWindow):
         self.folder_heading.set_visible(not info.is_repository)
         self.files_panel.set_visible(info.is_repository)
         self.workspace.set_visible(info.is_repository)
+        self.views.set_visible(info.is_repository)
+        self.view_switcher.set_visible(info.is_repository)
         self.files_panel.set_repository(info)
         self.commit_panel.set_repository(info)
+        self.remote_label.set_visible(info.is_repository)
+        if len(info.remotes) == 1:
+            destination = info.remotes[0]
+            if info.upstream_remote and info.upstream_ref:
+                destination = f"{info.upstream_remote}/{info.upstream_ref.removeprefix('refs/heads/')}"
+            else:
+                destination += " · sin seguimiento"
+            remote_text = f"Remoto · {destination}"
+        else:
+            remote_text = f"Varios remotos · {len(info.remotes)}" if info.remotes else "Sin remoto"
+        self.remote_label.set_text(display_text(remote_text))
+        self.remote_label.set_tooltip_text(display_text(remote_text))
         if info.is_repository:
             branch = f"Rama · {info.branch}" if info.branch else f"HEAD separado · {info.head_short}"
             self.branch_label.set_text(display_text(branch))
@@ -273,7 +331,59 @@ class MainWindow(Gtk.ApplicationWindow):
             self.notice_label.set_visible(True)
             self._set_status("Carpeta abierta. Vos decidís si querés inicializar Git.")
         self._update_actions()
-        self._request_diff(self.files_panel.selected_file, self.files_panel.selected_group)
+        if previous_root != info.root_path:
+            self.views.set_visible_child_name("changes")
+        self._refresh_current_view()
+
+    def _view_changed(self, _stack, _property):
+        if self.views.get_visible_child_name() == "history":
+            self._invalidate_diff()
+            if not self._history_loaded:
+                self._request_history()
+        else:
+            self._pending_history = None
+            self._request_diff(self.files_panel.selected_file, self.files_panel.selected_group)
+
+    def _refresh_current_view(self):
+        if self.views.get_visible_child_name() == "history":
+            if not self._history_loaded:
+                self._request_history()
+        else:
+            self._request_diff(self.files_panel.selected_file, self.files_panel.selected_group)
+
+    def _invalidate_history(self, message="Abrí Historial para consultar los commits recientes."):
+        self._history_generation += 1
+        self._pending_history = None
+        self._history_loaded = False
+        self.history_panel.clear(message)
+
+    def _request_history(self):
+        self._invalidate_history()
+        if not self.repository or not self.repository.is_repository:
+            return
+        self._pending_history = (self._history_generation, self.repository.root_path)
+        self.history_panel.show_loading()
+        self._start_pending_diff()
+
+    def _start_pending_history(self):
+        if self._pending_history is None:
+            return
+        generation, root = self._pending_history
+        self._pending_history = None
+
+        def completed(commits):
+            if generation == self._history_generation:
+                self.history_panel.show_history(commits)
+                self._history_loaded = True
+            self._start_pending_diff()
+
+        def failed(error):
+            if generation == self._history_generation:
+                self.history_panel.show_error(error)
+                self._set_status(str(error), error=True)
+            self._start_pending_diff()
+
+        self.diff_tasks.submit(lambda: self.service.get_history(root), completed, failed)
 
     def _file_selected(self, file, group):
         self._request_diff(file, group)
@@ -299,7 +409,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _start_pending_diff(self):
         if (self._closed or self.tasks.busy or self._dialog_pending or
-                self.diff_tasks.busy or self._pending_diff is None):
+                self.diff_tasks.busy):
+            return
+        if self.views.get_visible_child_name() == "history":
+            self._start_pending_history()
+            return
+        if self._pending_diff is None:
             return
         generation, root, path, staged = self._pending_diff
         self._pending_diff = None
@@ -328,21 +443,9 @@ class MainWindow(Gtk.ApplicationWindow):
             self._repository_loaded(info)
             self._set_status(success_message)
 
-        def failed(error):
-            self._show_failure(error)
-
-            def refreshed(info):
-                self._repository_loaded(info)
-                self._set_status(str(error), error=True)
-
-            self._start_task(
-                lambda: self.service.inspect_repository(path), refreshed,
-                "Comprobando el estado después del error…",
-                on_error=lambda _refresh_error: self._set_status(str(error), error=True),
-            )
-
         self._start_task(
-            lambda: operation(path), updated, "Actualizando los archivos preparados…", on_error=failed,
+            lambda: operation(path), updated, "Actualizando los archivos preparados…",
+            on_error=lambda error: self._refresh_after_error(path, error),
         )
 
     def _stage_file(self, file_path):
@@ -359,6 +462,84 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _stage_all(self):
         self._change_staging(self.service.stage_all, "Todos los cambios quedaron preparados para commit.")
+
+    def _sync(self, operation):
+        if self._closed or self.tasks.busy or self._dialog_pending or not self.repository:
+            return
+        problem = self.repository.pull_problem if operation == "pull" else self.repository.sync_problem
+        if problem:
+            return
+        path = self.repository.selected_path
+
+        def prepared(plan):
+            self._dialog_pending = True
+            self._update_actions()
+
+            def confirmed():
+                self._dialog_pending = False
+                self._run_sync(path, plan)
+
+            def cancelled():
+                self._dialog_pending = False
+                self._update_actions()
+                self._refresh_current_view()
+                self._set_status(f"{operation.capitalize()} cancelado. No se ejecutó la sincronización.")
+
+            confirm_sync(self, plan, confirmed, cancelled)
+
+        self._start_task(
+            lambda: self.service.prepare_sync(path, operation), prepared,
+            "Comprobando la rama y el remoto…", on_error=lambda error: self._refresh_after_error(path, error),
+        )
+
+    def _run_sync(self, path, plan):
+        name = plan.operation.capitalize()
+
+        def completed(result):
+            def remember_output():
+                self._last_sync = result
+                self.sync_details_button.set_label(f"Detalles de {name}")
+                self.sync_details_button.set_visible(True)
+
+            def refreshed(info):
+                self._repository_loaded(info)
+                self._set_status(f"{name} completado · {plan.destination}")
+                remember_output()
+
+            def refresh_failed(error):
+                self._show_failure(GitServiceError(
+                    f"{name} se completó, pero no se pudo actualizar la vista. Pulsá Actualizar.",
+                    stderr=error.details if isinstance(error, GitServiceError) else str(error),
+                ))
+                remember_output()
+
+            self._start_task(
+                lambda: self.service.inspect_repository(path), refreshed,
+                f"{name} completado. Actualizando el repositorio…", on_error=refresh_failed,
+            )
+
+        self._start_task(
+            lambda: self.service.sync(path, plan), completed,
+            f"{name} en curso · {plan.destination}…",
+            on_error=lambda error: self._refresh_after_error(path, error),
+        )
+
+    def _refresh_after_error(self, path, error):
+        self._show_failure(error)
+
+        def refreshed(info):
+            self._repository_loaded(info)
+            self._set_status(str(error), error=True)
+
+        self._start_task(
+            lambda: self.service.inspect_repository(path), refreshed,
+            "Comprobando el estado después del error…",
+            on_error=lambda _error: self._set_status(str(error), error=True),
+        )
+
+    def _show_sync_output(self, _button):
+        if self._last_sync:
+            show_output(self, display_text(self._last_sync.details))
 
     def _commit(self, message):
         if (self.tasks.busy or self._dialog_pending or not self.repository or
@@ -388,22 +569,10 @@ class MainWindow(Gtk.ApplicationWindow):
                     "Commit creado. Actualizando el repositorio…", on_error=refresh_failed,
                 )
 
-            def failed(error):
-                self._show_failure(error)
-
-                def refreshed(info):
-                    self._repository_loaded(info)
-                    self._set_status(str(error), error=True)
-
-                self._start_task(
-                    lambda: self.service.inspect_repository(path), refreshed,
-                    "Comprobando el estado después del error…",
-                    on_error=lambda _error: self._set_status(str(error), error=True),
-                )
-
             self._start_task(
                 lambda: self.service.commit(path, message, allow_detached=allow_detached),
-                committed, "Creando el commit…", on_error=failed,
+                committed, "Creando el commit…",
+                on_error=lambda error: self._refresh_after_error(path, error),
             )
 
         if self.repository.branch is None:

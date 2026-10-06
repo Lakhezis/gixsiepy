@@ -50,7 +50,7 @@ class WindowTests(unittest.TestCase):
 
     def tearDown(self):
         self.pump_until(lambda: not self.window.tasks.busy and not self.window.diff_tasks.busy
-                        and self.window._pending_diff is None)
+                        and self.window._pending_diff is None and self.window._pending_history is None)
         for window in list(self.Gtk.Window.get_toplevels()):
             window.destroy()
         self.window.tasks.close()
@@ -78,6 +78,13 @@ class WindowTests(unittest.TestCase):
     def wait_for_diff(self):
         self.pump_until(lambda: not self.window.diff_tasks.busy and self.window._pending_diff is None)
 
+    def wait_for_history(self):
+        self.pump_until(lambda: not self.window.diff_tasks.busy and self.window._pending_history is None)
+
+    def open_history(self):
+        self.window.views.set_visible_child_name("history")
+        self.wait_for_history()
+
     def diff_text(self):
         buffer = self.window.diff_panel.buffer
         return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
@@ -93,9 +100,20 @@ class WindowTests(unittest.TestCase):
         self.window.service.stage_file(self.folder, "a.txt")
         self.open_folder()
 
-    def git(self, *arguments):
+    def prepare_sync_repository(self, *, published=False):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        remote = Path(self.temporary.name) / "remoto.git"
+        self.git("init", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        if published:
+            self.git("push", "-u", "origin", "main")
+        self.open_folder()
+        return remote
+
+    def git(self, *arguments, cwd=None):
         return subprocess.run(
-            ["git", *arguments], cwd=self.folder, check=True, capture_output=True, text=True,
+            ["git", *arguments], cwd=cwd or self.folder, check=True, capture_output=True, text=True,
         ).stdout.strip()
 
     def test_welcome_and_css_render_without_parsing_errors(self):
@@ -732,6 +750,448 @@ class WindowTests(unittest.TestCase):
         with patch.object(self.window.service, "commit") as commit:
             panel.commit_button.emit("clicked")
             commit.assert_not_called()
+
+    def test_sync_buttons_explain_missing_repository_remote_upstream_and_pending_changes(self):
+        self.assertFalse(self.window.pull_button.get_sensitive())
+        self.assertFalse(self.window.push_button.get_sensitive())
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        self.assertFalse(self.window.push_button.get_sensitive())
+        self.assertIn("remoto", self.window.push_button.get_tooltip_text())
+        self.git("remote", "add", "origin", str(Path(self.temporary.name) / "remoto.git"))
+        self.open_folder()
+        self.assertTrue(self.window.push_button.get_sensitive())
+        self.assertFalse(self.window.pull_button.get_sensitive())
+        self.assertIn("seguimiento", self.window.pull_button.get_tooltip_text())
+        self.git("config", "branch.main.remote", "origin")
+        self.git("config", "branch.main.merge", "refs/heads/main")
+        (self.folder / "nuevo.txt").write_text("pendiente", encoding="utf-8")
+        self.open_folder()
+        self.assertFalse(self.window.pull_button.get_sensitive())
+        self.assertIn("pendientes", self.window.pull_button.get_tooltip_text())
+        self.assertTrue(self.window.push_button.get_sensitive())
+
+    def test_first_push_waits_for_confirmation_and_cancel_preserves_repository(self):
+        remote = self.prepare_sync_repository()
+        self.window.commit_panel.buffer.set_text("Borrador")
+        with patch("ui.window.confirm_sync") as confirm:
+            self.window.push_button.emit("clicked")
+            self.window.push_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            self.assertEqual(confirm.call_count, 1)
+            plan = confirm.call_args.args[1]
+            self.assertTrue(plan.set_upstream)
+            self.assertEqual(plan.destination, "origin/main")
+            self.assertFalse(self.window.push_button.get_sensitive())
+            self.assertFalse(self.window.open_button.get_sensitive())
+            self.assertEqual(self.git("for-each-ref", cwd=remote), "")
+            confirm.call_args.args[3]()
+        self.assertTrue(self.window.push_button.get_sensitive())
+        self.assertEqual(self.window.commit_panel.message, "Borrador")
+        self.assertIsNone(self.window.repository.upstream_ref)
+        self.assertIn("cancelado", self.window.status_label.get_text())
+        self.assertEqual(self.git("for-each-ref", cwd=remote), "")
+
+    def test_confirmed_push_updates_upstream_and_exposes_successful_git_output(self):
+        remote = self.prepare_sync_repository()
+        self.open_history()
+        self.window.commit_panel.buffer.set_text("Borrador")
+        with patch("ui.window.confirm_sync") as confirm:
+            self.window.push_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            confirm.call_args.args[2]()
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_history()
+        self.assertEqual(self.window.views.get_visible_child_name(), "history")
+        self.assertEqual(len(self.window.history_panel.commits), 1)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=remote), self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.window.repository.upstream_ref, "refs/heads/main")
+        self.assertIn("origin/main", self.window.remote_label.get_text())
+        self.assertTrue(self.window.pull_button.get_sensitive())
+        self.assertEqual(self.window.commit_panel.message, "Borrador")
+        self.assertIn("Push completado", self.window.status_label.get_text())
+        self.assertTrue(self.window.sync_details_button.get_visible())
+        with patch("ui.window.show_output") as show:
+            self.window.sync_details_button.emit("clicked")
+            self.assertIn("main", show.call_args.args[1])
+
+    def test_confirmed_pull_refreshes_branch_files_and_preserves_commit_draft(self):
+        remote = self.prepare_sync_repository(published=True)
+        self.open_history()
+        other = Path(self.temporary.name) / "otro equipo"
+        self.git("clone", str(remote), str(other))
+        (other / "a.txt").write_text("actualizado por pull\n", encoding="utf-8")
+        self.git("add", "-A", cwd=other)
+        self.git("-c", "user.name=Prueba", "-c", "user.email=prueba@example.test",
+                 "-c", "commit.gpgSign=false", "commit", "-m", "Remoto", cwd=other)
+        self.git("push", cwd=other)
+        self.window.commit_panel.buffer.set_text("Borrador")
+        before = self.window.repository.head_short
+        with patch("ui.window.confirm_sync") as confirm:
+            self.window.pull_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            self.assertEqual(confirm.call_args.args[1].operation, "pull")
+            self.assertEqual((self.folder / "a.txt").read_text(encoding="utf-8"), "preparado\n")
+            confirm.call_args.args[2]()
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_history()
+        self.assertEqual(self.window.views.get_visible_child_name(), "history")
+        self.assertEqual(self.window.history_panel.commits[0].message, "Remoto")
+        self.assertEqual(len(self.window.history_panel.commits), 2)
+        self.assertNotEqual(before, self.window.repository.head_short)
+        self.assertEqual((self.folder / "a.txt").read_text(encoding="utf-8"), "actualizado por pull\n")
+        self.assertEqual(self.window.repository.files, ())
+        self.assertEqual(self.window.commit_panel.message, "Borrador")
+        self.assertIn("Pull completado", self.window.status_label.get_text())
+        self.assertIn("Fast-forward", self.window._last_sync.details)
+
+    def test_slow_sync_keeps_gtk_responsive_and_prevents_duplicate_operations(self):
+        remote = self.prepare_sync_repository()
+        original = self.window.service.sync
+        started, release = threading.Event(), threading.Event()
+
+        def delayed(*args):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("La prueba no liberó el trabajador")
+            return original(*args)
+
+        with patch.object(self.window.service, "sync", side_effect=delayed) as sync, \
+                patch("ui.window.confirm_sync") as confirm:
+            try:
+                self.window.push_button.emit("clicked")
+                self.pump_until(lambda: self.window._dialog_pending)
+                confirm.call_args.args[2]()
+                self.pump_until(started.is_set)
+                responsive = []
+                self.GLib.idle_add(lambda: responsive.append(True) and False)
+                self.pump_until(lambda: bool(responsive))
+                for button in (self.window.pull_button, self.window.push_button,
+                               self.window.refresh_button, self.window.open_button):
+                    self.assertFalse(button.get_sensitive())
+                self.assertFalse(self.window.commit_panel.message_view.get_sensitive())
+                self.assertTrue(self.window._on_close_request(self.window))
+                self.window.push_button.emit("clicked")
+                self.window.pull_button.emit("clicked")
+                self.assertEqual(sync.call_count, 1)
+            finally:
+                release.set()
+            self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD", cwd=remote), "1")
+
+    def test_failed_push_keeps_draft_and_displays_remote_hook_error(self):
+        remote = self.prepare_sync_repository()
+        hook = remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nprintf 'Rechazado por el servidor\\n' >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.window.commit_panel.buffer.set_text("Conservar")
+        with patch("ui.window.confirm_sync") as confirm, patch("ui.window.show_error") as show:
+            self.window.push_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            confirm.call_args.args[2]()
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertIn("Push", show.call_args.args[1])
+            self.assertIn("Rechazado por el servidor", show.call_args.args[2])
+        self.assertEqual(self.window.commit_panel.message, "Conservar")
+        self.assertEqual(self.git("for-each-ref", cwd=remote), "")
+        self.assertIsNone(self.window.repository.upstream_ref)
+        self.assertTrue(self.window.push_button.get_sensitive())
+        self.assertFalse(self.window.sync_details_button.get_visible())
+
+    def test_changed_remote_after_confirmation_does_not_publish(self):
+        remote = self.prepare_sync_repository()
+        with patch("ui.window.confirm_sync") as confirm, patch("ui.window.show_error") as show:
+            self.window.push_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            self.git("remote", "set-url", "origin", str(Path(self.temporary.name) / "otro.git"))
+            confirm.call_args.args[2]()
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertIn("cambiaron", show.call_args.args[1])
+        self.assertEqual(self.git("for-each-ref", cwd=remote), "")
+
+    def test_successful_push_with_refresh_failure_is_not_reported_as_failed_push(self):
+        from git.git_service import GitServiceError
+        remote = self.prepare_sync_repository()
+        original_sync = self.window.service.sync
+        original_inspect = self.window.service.inspect_repository
+        completed = []
+
+        def sync(*args):
+            result = original_sync(*args)
+            completed.append(True)
+            return result
+
+        def inspect(*args):
+            if completed:
+                raise GitServiceError("No se puede consultar", stderr="Error al actualizar")
+            return original_inspect(*args)
+
+        with patch.object(self.window.service, "sync", side_effect=sync), \
+                patch.object(self.window.service, "inspect_repository", side_effect=inspect), \
+                patch("ui.window.confirm_sync") as confirm, patch("ui.window.show_error") as show:
+            self.window.push_button.emit("clicked")
+            self.pump_until(lambda: self.window._dialog_pending)
+            confirm.call_args.args[2]()
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertIn("Push se completó", show.call_args.args[1])
+            self.assertIn("Error al actualizar", show.call_args.args[2])
+        self.assertEqual(self.git("rev-list", "--count", "HEAD", cwd=remote), "1")
+        self.assertTrue(self.window.sync_details_button.get_visible())
+        self.assertIn("main", self.window._last_sync.details)
+
+    def test_history_tabs_are_available_only_for_repositories_and_open_without_writing(self):
+        self.assertFalse(self.window.view_switcher.get_visible())
+        self.open_folder()
+        self.assertFalse(self.window.view_switcher.get_visible())
+        self.create_repository()
+        self.open_folder()
+        self.assertTrue(self.window.view_switcher.get_visible())
+        self.assertEqual(self.window.views.get_visible_child_name(), "changes")
+        self.assertIs(self.window.view_switcher.get_stack(), self.window.views)
+
+        def has_history_label(widget):
+            if isinstance(widget, self.Gtk.Label) and widget.get_text() == "Historial":
+                return True
+            child = widget.get_first_child()
+            while child:
+                if has_history_label(child):
+                    return True
+                child = child.get_next_sibling()
+            return False
+
+        button = self.window.view_switcher.get_first_child()
+        while button and not has_history_label(button):
+            button = button.get_next_sibling()
+        self.assertIsNotNone(button)
+        button.emit("clicked")
+        self.wait_for_history()
+        self.assertEqual(self.window.views.get_visible_child_name(), "history")
+        self.assertEqual(self.window.history_panel.count_label.get_text(), "0")
+        self.assertIn("Todavía no hay commits", self.window.history_panel.message_label.get_text())
+        self.assertFalse(self.window.history_panel.spinner.get_spinning())
+        self.assertEqual(self.git("ls-files"), "")
+
+    def test_history_rows_show_literal_message_author_date_and_selectable_hash(self):
+        self.prepare_commit()
+        self.git("config", "user.name", "Ana & Jardín 🌸")
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2025-06-01T15:30:00-03:00"}):
+            self.window.service.commit(self.folder, "<b>Flores & plantas 🌸</b>\n\nExplicación")
+        self.open_folder()
+        self.open_history()
+        panel = self.window.history_panel
+        row = panel.listing.get_row_at_index(0)
+        self.assertEqual(row.message_label.get_text(), "<b>Flores & plantas 🌸</b>")
+        self.assertFalse(row.message_label.get_use_markup())
+        self.assertEqual(row.author_label.get_text(), "Ana & Jardín 🌸")
+        self.assertEqual(row.date_label.get_text(), "01/06/2025 · 15:30 -0300")
+        self.assertEqual(row.hash_label.get_text(), self.git("rev-parse", "--short=7", "HEAD"))
+        self.assertTrue(row.hash_label.get_selectable())
+        self.assertFalse(row.get_activatable())
+        self.assertFalse(row.get_selectable())
+        self.assertFalse(panel.message_label.get_visible())
+        self.assertEqual(panel.count_label.get_text(), "1")
+
+    def test_switching_views_preserves_staged_selection_diff_and_commit_draft(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        (self.folder / "a.txt").write_text("versión preparada\n", encoding="utf-8")
+        self.window.service.stage_file(self.folder, "a.txt")
+        (self.folder / "a.txt").write_text("edición posterior\n", encoding="utf-8")
+        self.open_folder()
+        files = self.window.files_panel
+        files.staged_list.select_row(files.staged_list.get_row_at_index(0))
+        self.wait_for_diff()
+        self.window.commit_panel.buffer.set_text("Conservar borrador")
+        before = self.git("ls-files", "--stage")
+        with patch.object(self.window.service, "get_history", wraps=self.window.service.get_history) as history:
+            self.open_history()
+            self.window.views.set_visible_child_name("changes")
+            self.wait_for_diff()
+            self.assertIn("+versión preparada", self.diff_text())
+            self.assertEqual(files.selected_file.path, "a.txt")
+            self.assertEqual(files.selected_group, "staged")
+            self.assertEqual(self.window.commit_panel.message, "Conservar borrador")
+            self.open_history()
+            self.assertEqual(history.call_count, 1)
+        self.assertEqual(self.git("ls-files", "--stage"), before)
+
+    def test_first_commit_invalidates_cached_empty_history(self):
+        self.prepare_commit()
+        self.open_history()
+        self.assertEqual(self.window.history_panel.commits, ())
+        self.window.views.set_visible_child_name("changes")
+        self.window.commit_panel.buffer.set_text("Mi primer commit")
+        self.window.commit_panel.commit_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.open_history()
+        self.assertEqual(self.window.history_panel.commits[0].message, "Mi primer commit")
+        self.assertEqual(self.window.history_panel.count_label.get_text(), "1")
+
+    def test_manual_refresh_updates_visible_history_after_external_commit(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        self.open_history()
+        self.git("commit", "--allow-empty", "-m", "Creado desde la terminal")
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_history()
+        self.assertEqual(self.window.views.get_visible_child_name(), "history")
+        self.assertEqual(self.window.history_panel.commits[0].message, "Creado desde la terminal")
+        self.assertEqual(len(self.window.history_panel.commits), 2)
+
+    def test_slow_history_keeps_gtk_responsive_and_coalesces_fast_view_switches(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        original = self.window.service.get_history
+        started, release = threading.Event(), threading.Event()
+        reads = []
+
+        def delayed(root):
+            reads.append(root)
+            if len(reads) == 1:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("La prueba no liberó el lector")
+            return original(root)
+
+        with patch.object(self.window.service, "get_history", side_effect=delayed):
+            try:
+                self.window.views.set_visible_child_name("history")
+                self.pump_until(started.is_set)
+                self.assertTrue(self.window.history_panel.spinner.get_spinning())
+                responsive = []
+                self.GLib.idle_add(lambda: responsive.append(True) and False)
+                self.pump_until(lambda: bool(responsive))
+                self.assertTrue(self.window.open_button.get_sensitive())
+                self.assertTrue(self.window.refresh_button.get_sensitive())
+                for _index in range(3):
+                    self.window.views.set_visible_child_name("changes")
+                    self.window.views.set_visible_child_name("history")
+            finally:
+                release.set()
+            self.wait_for_history()
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(self.window.history_panel.count_label.get_text(), "1")
+        self.assertFalse(self.window.history_panel.spinner.get_spinning())
+
+    def test_switching_repository_discards_history_still_loading(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Del repositorio anterior")
+        self.open_folder()
+        other = Path(self.temporary.name) / "otra carpeta"
+        other.mkdir()
+        self.window.service.initialize_repository(other)
+        self.git("config", "user.name", "Otro autor", cwd=other)
+        self.git("config", "user.email", "otro@example.test", cwd=other)
+        (other / "otro.txt").write_text("otro", encoding="utf-8")
+        self.window.service.stage_all(other)
+        self.window.service.commit(other, "Del repositorio nuevo")
+        original = self.window.service.get_history
+        started, release = threading.Event(), threading.Event()
+
+        def delayed(root):
+            commits = original(root)
+            if root == self.folder:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("La prueba no liberó el lector")
+            return commits
+
+        with patch.object(self.window.service, "get_history", side_effect=delayed):
+            try:
+                self.window.views.set_visible_child_name("history")
+                self.pump_until(started.is_set)
+                self.window.open_repository(other)
+                self.pump_until(lambda: not self.window.tasks.busy)
+                self.assertEqual(self.window.views.get_visible_child_name(), "changes")
+                self.assertEqual(self.window.history_panel.commits, ())
+                self.window.views.set_visible_child_name("history")
+            finally:
+                release.set()
+            self.wait_for_history()
+        self.assertEqual([commit.message for commit in self.window.history_panel.commits], ["Del repositorio nuevo"])
+        self.assertEqual(self.window.history_panel.listing.get_row_at_index(0).author_label.get_text(), "Otro autor")
+
+    def test_refresh_discards_an_old_history_read_and_reloads_new_commits(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        original = self.window.service.get_history
+        started, release = threading.Event(), threading.Event()
+        reads = []
+
+        def delayed(root):
+            commits = original(root)
+            reads.append(root)
+            if len(reads) == 1:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("La prueba no liberó el lector")
+            return commits
+
+        with patch.object(self.window.service, "get_history", side_effect=delayed):
+            try:
+                self.window.views.set_visible_child_name("history")
+                self.pump_until(started.is_set)
+                self.git("commit", "--allow-empty", "-m", "Nuevo commit externo")
+                self.window.refresh_button.emit("clicked")
+                self.pump_until(lambda: not self.window.tasks.busy)
+            finally:
+                release.set()
+            self.wait_for_history()
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(len(self.window.history_panel.commits), 2)
+        self.assertEqual(self.window.history_panel.commits[0].message, "Nuevo commit externo")
+
+    def test_history_error_exposes_git_details_and_manual_refresh_can_retry(self):
+        from git.git_service import GitServiceError
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        error = GitServiceError("No se pudo leer el historial", stderr="fatal: bad object HEAD", returncode=128)
+        with patch.object(self.window.service, "get_history", side_effect=error):
+            self.open_history()
+        panel = self.window.history_panel
+        self.assertIn("No se pudo leer", panel.message_label.get_text())
+        self.assertTrue(panel.details_button.get_visible())
+        self.assertFalse(panel.spinner.get_spinning())
+        with patch.object(panel, "on_details") as details:
+            panel.details_button.emit("clicked")
+            details.assert_called_once_with(error)
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_history()
+        self.assertFalse(panel.details_button.get_visible())
+        self.assertEqual(len(panel.commits), 1)
+
+    def test_closing_during_history_read_does_not_update_destroyed_window(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Inicial")
+        self.open_folder()
+        original = self.window.service.get_history
+        started, release = threading.Event(), threading.Event()
+
+        def delayed(root):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("La prueba no liberó el lector")
+            return original(root)
+
+        with patch.object(self.window.service, "get_history", side_effect=delayed), \
+                patch.object(self.window.history_panel, "show_history") as render:
+            try:
+                self.window.views.set_visible_child_name("history")
+                self.pump_until(started.is_set)
+                self.window.close()
+                self.pump()
+                self.assertTrue(self.window._closed)
+            finally:
+                release.set()
+            self.wait_for_history()
+            render.assert_not_called()
 
 
 if __name__ == "__main__":
