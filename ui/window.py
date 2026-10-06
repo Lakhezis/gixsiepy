@@ -6,7 +6,8 @@ import traceback
 from gi.repository import Gio, GLib, Gtk, Pango
 
 from git.git_service import GitService, GitServiceError
-from ui.dialogs import confirm_initialization, show_error
+from ui.dialogs import confirm_detached_commit, confirm_initialization, show_error
+from ui.commit_panel import CommitPanel
 from ui.diff_panel import DiffPanel
 from ui.files_panel import FilesPanel, STATUS_NAMES, display_path, display_text
 from ui.tasks import TaskRunner
@@ -81,6 +82,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.repo_card = repo_card
         repo_card.add_css_class("card")
         heading = Gtk.Label(label="TU CARPETA", xalign=0)
+        self.folder_heading = heading
         heading.add_css_class("eyebrow")
         repo_card.append(heading)
         self.name_label = Gtk.Label(xalign=0, wrap=True, selectable=True)
@@ -111,12 +113,16 @@ class MainWindow(Gtk.ApplicationWindow):
             on_stage_all=self._stage_all, on_select=self._file_selected,
         )
         self.files_panel.set_visible(False)
-        files_scroll = Gtk.ScrolledWindow(min_content_width=290, min_content_height=360)
+        files_scroll = Gtk.ScrolledWindow(min_content_width=290, min_content_height=160, vexpand=True)
         files_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         files_scroll.set_child(self.files_panel)
         self.diff_panel = DiffPanel(on_details=self._show_failure)
+        self.commit_panel = CommitPanel(on_commit=self._commit)
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        sidebar.append(files_scroll)
+        sidebar.append(self.commit_panel)
         self.workspace = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
-        self.workspace.set_start_child(files_scroll)
+        self.workspace.set_start_child(sidebar)
         self.workspace.set_end_child(self.diff_panel)
         self.workspace.set_position(350)
         self.workspace.set_resize_start_child(False)
@@ -156,6 +162,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.spinner.set_visible(self.tasks.busy)
         self.spinner.set_spinning(self.tasks.busy)
         self.files_panel.set_blocked(blocked)
+        self.commit_panel.set_blocked(blocked)
         self._start_pending_diff()
 
     def _choose_folder(self, _button):
@@ -233,9 +240,11 @@ class MainWindow(Gtk.ApplicationWindow):
         else:
             self.repo_card.remove_css_class("repository-summary")
         self.description_label.set_visible(not info.is_repository)
+        self.folder_heading.set_visible(not info.is_repository)
         self.files_panel.set_visible(info.is_repository)
         self.workspace.set_visible(info.is_repository)
         self.files_panel.set_repository(info)
+        self.commit_panel.set_repository(info)
         if info.is_repository:
             branch = f"Rama · {info.branch}" if info.branch else f"HEAD separado · {info.head_short}"
             self.branch_label.set_text(display_text(branch))
@@ -350,6 +359,65 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _stage_all(self):
         self._change_staging(self.service.stage_all, "Todos los cambios quedaron preparados para commit.")
+
+    def _commit(self, message):
+        if (self.tasks.busy or self._dialog_pending or not self.repository or
+                not self.repository.can_commit or not message.strip()):
+            return
+        path = self.repository.selected_path
+
+        def execute(allow_detached=False):
+            self._dialog_pending = False
+
+            def committed(_output):
+                # El commit ya existe aunque una consulta posterior a Git falle.
+                self.commit_panel.clear_message()
+
+                def refreshed(info):
+                    self._repository_loaded(info)
+                    self._set_status(f"Commit creado correctamente · {info.head_short}")
+
+                def refresh_failed(error):
+                    self._show_failure(GitServiceError(
+                        "El commit se creó, pero no se pudo actualizar la vista. Pulsá Actualizar.",
+                        stderr=error.details if isinstance(error, GitServiceError) else str(error),
+                    ))
+
+                self._start_task(
+                    lambda: self.service.inspect_repository(path), refreshed,
+                    "Commit creado. Actualizando el repositorio…", on_error=refresh_failed,
+                )
+
+            def failed(error):
+                self._show_failure(error)
+
+                def refreshed(info):
+                    self._repository_loaded(info)
+                    self._set_status(str(error), error=True)
+
+                self._start_task(
+                    lambda: self.service.inspect_repository(path), refreshed,
+                    "Comprobando el estado después del error…",
+                    on_error=lambda _error: self._set_status(str(error), error=True),
+                )
+
+            self._start_task(
+                lambda: self.service.commit(path, message, allow_detached=allow_detached),
+                committed, "Creando el commit…", on_error=failed,
+            )
+
+        if self.repository.branch is None:
+            self._dialog_pending = True
+            self._update_actions()
+
+            def cancelled():
+                self._dialog_pending = False
+                self._update_actions()
+                self._set_status("Commit cancelado. El mensaje y los archivos preparados se conservaron.")
+
+            confirm_detached_commit(self, lambda: execute(True), cancelled)
+        else:
+            execute()
 
     def _confirm_init(self, _button):
         if self.tasks.busy or self._dialog_pending or not self.repository or self.repository.is_repository:

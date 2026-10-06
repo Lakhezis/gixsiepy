@@ -101,6 +101,10 @@ class RepositoryInfo:
     def can_stage_all(self):
         return bool(self.unstaged_files) and all(file.can_stage for file in self.unstaged_files)
 
+    @property
+    def can_commit(self):
+        return bool(self.staged_files) and not any(file.conflicted for file in self.files)
+
 
 class GitService:
     def __init__(self, timeout=30):
@@ -167,6 +171,16 @@ class GitService:
             )
         elif "Permission denied" in result.stderr:
             message = "Git no tiene permiso para acceder al repositorio. Revisá los permisos."
+        elif "Author identity unknown" in result.stderr or "unable to auto-detect email address" in result.stderr:
+            message = (
+                "Git necesita tu nombre y correo para crear commits. "
+                "Configurá user.name y user.email en Git y volvé a intentar."
+            )
+        elif "failed to sign" in result.stderr or "gpg failed" in result.stderr:
+            message = (
+                "Git no pudo firmar el commit. Revisá tu configuración de firma "
+                "y el acceso a tu clave antes de volver a intentar."
+            )
         else:
             message = "Git no pudo completar la operación. Podés consultar su mensaje en los detalles."
         return GitServiceError(
@@ -257,7 +271,7 @@ class GitService:
     def _working_repository(self, path):
         info = self.inspect_repository(path)
         if not info.is_repository:
-            raise GitServiceError("Abrí o inicializá un repositorio antes de preparar archivos.")
+            raise GitServiceError("Abrí o inicializá un repositorio para realizar esta acción.")
         return info
 
     @staticmethod
@@ -350,6 +364,25 @@ class GitService:
             )
         self._run(["add", "-A"], cwd=info.root_path)
         return self.inspect_repository(repository_path)
+
+    def commit(self, repository_path, message, *, allow_detached=False):
+        """Crear el commit; la actualización posterior se realiza por separado."""
+        if not message.strip():
+            raise GitServiceError("Escribí un mensaje para explicar los cambios del commit.")
+        if "\0" in message:
+            raise GitServiceError("El mensaje contiene un carácter nulo que Git no puede recibir.")
+        info = self._working_repository(repository_path)
+        if any(file.conflicted for file in info.files):
+            raise GitServiceError("Hay conflictos pendientes. Resolvelos antes de hacer un commit.")
+        if not info.staged_files:
+            raise GitServiceError("Prepará al menos un archivo (Stage) antes de hacer un commit.")
+        if info.branch is None and not allow_detached:
+            raise GitServiceError("El repositorio tiene HEAD separado. Confirmá antes de crear un commit sin rama.")
+        # Sin -a: guardar solo el índice. Conservar líneas del mensaje que empiezan por #.
+        result = self._run(
+            ["commit", "--cleanup=whitespace", "-m", message.strip()], cwd=info.root_path,
+        )
+        return result.stdout
 
     def initialize_repository(self, path):
         """Invocar solamente después de la confirmación explícita en la UI."""

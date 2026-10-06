@@ -85,6 +85,14 @@ class WindowTests(unittest.TestCase):
     def create_repository(self):
         self.window.service.initialize_repository(self.folder)
 
+    def prepare_commit(self):
+        self.create_repository()
+        self.git("config", "user.name", "Prueba")
+        self.git("config", "user.email", "prueba@example.test")
+        (self.folder / "a.txt").write_text("preparado\n", encoding="utf-8")
+        self.window.service.stage_file(self.folder, "a.txt")
+        self.open_folder()
+
     def git(self, *arguments):
         return subprocess.run(
             ["git", *arguments], cwd=self.folder, check=True, capture_output=True, text=True,
@@ -524,6 +532,206 @@ class WindowTests(unittest.TestCase):
         with patch.object(self.window.diff_panel, "on_details") as details:
             self.window.diff_panel.details_button.emit("clicked")
             details.assert_called_once_with(error)
+
+    def test_commit_button_requires_message_and_prepared_files(self):
+        panel = self.window.commit_panel
+        self.assertFalse(panel.message_view.get_accepts_tab())
+        self.assertFalse(panel.message_view.get_monospace())
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.assertFalse(panel.message_view.get_sensitive())
+        self.create_repository()
+        (self.folder / "a.txt").write_text("nuevo", encoding="utf-8")
+        self.open_folder()
+        panel.buffer.set_text("Mensaje sin staging")
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.window.files_panel.stage_all_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertTrue(panel.commit_button.get_sensitive())
+        panel.buffer.set_text(" \n\t ")
+        self.assertFalse(panel.commit_button.get_sensitive())
+        panel.buffer.set_text("Mensaje")
+        self.assertTrue(panel.commit_button.get_sensitive())
+        self.window.files_panel.staged_list.select_row(self.window.files_panel.staged_list.get_row_at_index(0))
+        self.window.files_panel.unstage_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertFalse(panel.commit_button.get_sensitive())
+
+    def test_successful_commit_clears_message_refreshes_files_and_diff(self):
+        self.prepare_commit()
+        (self.folder / "a.txt").write_text("edición posterior\n", encoding="utf-8")
+        self.open_folder()
+        files = self.window.files_panel
+        files.staged_list.select_row(files.staged_list.get_row_at_index(0))
+        self.wait_for_diff()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Primero\n\nExplicación 🌸")
+        panel.commit_button.emit("clicked")
+        panel.commit_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.wait_for_diff()
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(self.git("log", "-1", "--format=%B"), "Primero\n\nExplicación 🌸")
+        self.assertEqual(panel.message, "")
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.assertEqual(files.staged_count.get_text(), "0")
+        self.assertEqual(files.changes_count.get_text(), "1")
+        self.assertEqual(files.selected_group, "changes")
+        self.assertIn("+edición posterior", self.diff_text())
+        self.assertIn("Commit creado correctamente", self.window.status_label.get_text())
+        self.assertFalse(self.window.notice_label.get_visible())
+
+    def test_slow_commit_keeps_gtk_responsive_and_blocks_duplicate_actions(self):
+        self.prepare_commit()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Un solo commit")
+        original = self.window.service.commit
+        started, release = threading.Event(), threading.Event()
+
+        def delayed(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("La prueba no liberó el trabajador")
+            return original(*args, **kwargs)
+
+        with patch.object(self.window.service, "commit", side_effect=delayed) as commit:
+            try:
+                panel.commit_button.emit("clicked")
+                self.pump_until(started.is_set)
+                responsive = []
+                self.GLib.idle_add(lambda: responsive.append(True) and False)
+                self.pump_until(lambda: bool(responsive))
+                self.assertFalse(panel.commit_button.get_sensitive())
+                self.assertFalse(panel.message_view.get_sensitive())
+                self.assertFalse(self.window.open_button.get_sensitive())
+                self.assertFalse(self.window.files_panel.stage_all_button.get_sensitive())
+                self.assertTrue(self.window._on_close_request(self.window))
+                panel.commit_button.emit("clicked")
+                self.assertEqual(commit.call_count, 1)
+            finally:
+                release.set()
+            self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+        self.assertTrue(panel.message_view.get_sensitive())
+
+    def test_rejected_commit_keeps_draft_and_git_details_for_retry(self):
+        self.prepare_commit()
+        hook = self.folder / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nprintf 'Hook rechazó el commit\\n' >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o700)
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Conservar mi mensaje")
+        with patch("ui.window.show_error") as show:
+            panel.commit_button.emit("clicked")
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertIn("Hook rechazó", show.call_args.args[2])
+        self.assertEqual(panel.message, "Conservar mi mensaje")
+        self.assertTrue(panel.commit_button.get_sensitive())
+        self.assertEqual(self.window.files_panel.staged_count.get_text(), "1")
+        self.assertIn("Git no pudo", self.window.status_label.get_text())
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        panel.commit_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.message, "")
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_commit_revalidates_external_unstage_and_keeps_message(self):
+        self.prepare_commit()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Conservar")
+        self.window.service.unstage_file(self.folder, "a.txt")
+        with patch("ui.window.show_error"):
+            panel.commit_button.emit("clicked")
+            self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.message, "Conservar")
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.assertEqual(self.window.files_panel.staged_count.get_text(), "0")
+        self.assertIn("Prepará", self.window.status_label.get_text())
+
+    def test_refresh_failure_after_commit_reports_success_and_clears_message(self):
+        from git.git_service import GitServiceError
+        self.prepare_commit()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Commit real")
+        original_commit = self.window.service.commit
+        original_inspect = self.window.service.inspect_repository
+        committed = []
+
+        def create(*args, **kwargs):
+            output = original_commit(*args, **kwargs)
+            committed.append(True)
+            return output
+
+        def inspect(*args):
+            if committed:
+                raise GitServiceError("Error de lectura", stderr="Detalle del error al actualizar")
+            return original_inspect(*args)
+
+        with patch.object(self.window.service, "commit", side_effect=create), \
+                patch.object(self.window.service, "inspect_repository", side_effect=inspect), \
+                patch("ui.window.show_error") as show:
+            panel.commit_button.emit("clicked")
+            self.pump_until(lambda: not self.window.tasks.busy)
+            self.assertIn("El commit se creó", show.call_args.args[1])
+            self.assertIn("Detalle del error", show.call_args.args[2])
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(panel.message, "")
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(self.window.files_panel.staged_count.get_text(), "0")
+
+    def test_refresh_preserves_draft_and_opening_another_repository_clears_it(self):
+        self.prepare_commit()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Borrador de este repositorio")
+        self.window.refresh_button.emit("clicked")
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.message, "Borrador de este repositorio")
+        other = Path(self.temporary.name) / "otro repositorio"
+        other.mkdir()
+        self.window.service.initialize_repository(other)
+        self.window.open_repository(other)
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(panel.message, "")
+
+    def test_detached_commit_can_be_cancelled_or_explicitly_confirmed(self):
+        self.prepare_commit()
+        self.window.service.commit(self.folder, "Primero")
+        self.git("checkout", "--detach")
+        (self.folder / "a.txt").write_text("otro", encoding="utf-8")
+        self.window.service.stage_all(self.folder)
+        self.open_folder()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("Sin rama")
+        with patch("ui.window.confirm_detached_commit") as confirm:
+            panel.commit_button.emit("clicked")
+            panel.commit_button.emit("clicked")
+            self.assertEqual(confirm.call_count, 1)
+            self.assertFalse(panel.commit_button.get_sensitive())
+            confirm.call_args.args[2]()
+            self.assertEqual(panel.message, "Sin rama")
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+            panel.commit_button.emit("clicked")
+            confirm.call_args.args[1]()
+        self.pump_until(lambda: not self.window.tasks.busy)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(panel.message, "")
+
+    def test_conflicts_disable_commit_even_when_other_files_are_prepared(self):
+        from dataclasses import replace
+        from git.git_service import FileChange
+        self.prepare_commit()
+        panel = self.window.commit_panel
+        panel.buffer.set_text("No guardar conflictos")
+        info = self.window.repository
+        self.window._repository_loaded(replace(
+            info, files=(*info.files, FileChange("conflicto.txt", "U", "U", conflicted=True)),
+        ))
+        self.assertFalse(panel.commit_button.get_sensitive())
+        self.assertIn("conflictos", panel.help_label.get_text())
+        with patch.object(self.window.service, "commit") as commit:
+            panel.commit_button.emit("clicked")
+            commit.assert_not_called()
 
 
 if __name__ == "__main__":

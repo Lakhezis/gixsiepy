@@ -4,14 +4,30 @@ from gi.repository import GLib, Gtk
 
 
 def confirm_initialization(parent, folder, on_confirm, on_cancel):
-    dialog = Gtk.AlertDialog(
-        message="¿Inicializar un repositorio Git?",
-        detail=(
+    _confirm(
+        parent, "¿Inicializar un repositorio Git?",
+        (
             f"Carpeta: {folder}\n\n"
             "Se creará el repositorio en esta carpeta. "
             "Tus archivos se conservarán y todavía no se hará ningún commit."
         ),
-        buttons=["Cancelar", "Inicializar repositorio"],
+        "Inicializar repositorio", on_confirm, on_cancel,
+    )
+
+
+def confirm_detached_commit(parent, on_confirm, on_cancel):
+    _confirm(
+        parent, "¿Crear un commit sin una rama activa?",
+        "Estás en HEAD separado. El commit no quedará asociado a una rama. "
+        "Para conservarlo al cambiar de posición, tendrás que crear una rama "
+        "desde la terminal u otra herramienta.",
+        "Hacer commit", on_confirm, on_cancel,
+    )
+
+
+def _confirm(parent, message, detail, accept_label, on_confirm, on_cancel):
+    dialog = Gtk.AlertDialog(
+        message=message, detail=detail, buttons=["Cancelar", accept_label],
         cancel_button=0, default_button=0, modal=True,
     )
 

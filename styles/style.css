@@ -70,7 +70,7 @@
 .git-gui .status-error { color: #823746; }
 .git-gui textview, .git-gui textview text { background-color: #fff9f8; color: #0d2426; }
 .git-gui scrollbar slider { min-width: 8px; min-height: 8px; }
-.git-gui .repository-summary { padding: 20px 24px; }
+.git-gui .repository-summary { padding: 12px 24px; }
 .git-gui .repository-summary .hero-title { font-size: 22px; }
 .git-gui .files-group {
   background-color: #fffdfb;
@@ -107,3 +107,10 @@
   color: #0d2426;
 }
 .git-gui paned > separator { min-width: 6px; background-color: #f2dfe6; border-radius: 3px; }
+.git-gui .commit-panel {
+  background-color: #fff8ff;
+  border: 1px solid #e4d4eb;
+  border-radius: 20px;
+  padding: 16px 18px;
+}
+.git-gui .commit-message { border: 1px solid #ecd7dc; border-radius: 12px; }

@@ -44,6 +44,13 @@ class GitServiceTests(unittest.TestCase):
         self.git("-c", "user.name=Prueba", "-c", "user.email=prueba@example.test",
                  "-c", "commit.gpgSign=false", "commit", "-m", message, cwd=cwd)
 
+    def prepare_commit(self):
+        self.git("init")
+        self.git("config", "user.name", "Prueba")
+        self.git("config", "user.email", "prueba@example.test")
+        (self.folder / "hola.txt").write_text("preparado\n", encoding="utf-8")
+        self.service.stage_file(self.folder, "hola.txt")
+
     def test_inspection_does_not_initialize_a_folder(self):
         info = self.service.inspect_repository(self.folder)
         self.assertFalse(info.is_repository)
@@ -343,6 +350,12 @@ class GitServiceTests(unittest.TestCase):
             self.service.stage_all(self.folder)
         with self.assertRaises(GitServiceError):
             self.service.stage_file(self.folder, "hola.txt")
+        (self.folder / "otro.txt").write_text("sin conflictos", encoding="utf-8")
+        info = self.service.stage_file(self.folder, "otro.txt")
+        self.assertTrue(info.staged_files)
+        self.assertFalse(info.can_commit)
+        with self.assertRaisesRegex(GitServiceError, "conflictos"):
+            self.service.commit(self.folder, "No guardar conflictos")
         self.assertEqual((self.folder / "hola.txt").read_bytes(), original)
 
     def test_submodule_working_changes_are_identified_and_not_silently_staged(self):
@@ -531,6 +544,117 @@ class GitServiceTests(unittest.TestCase):
             with self.assertRaises(GitServiceError) as error:
                 self.service.get_diff(self.folder, "nuevo.txt")
         self.assertIn("Could not access", error.exception.details)
+
+    def test_first_commit_records_only_staged_versions(self):
+        self.prepare_commit()
+        (self.folder / "hola.txt").write_text("edición posterior\n", encoding="utf-8")
+        (self.folder / "nuevo.txt").write_text("sin preparar", encoding="utf-8")
+        self.service.commit(self.folder, "Primer commit")
+        self.assertEqual(self.git("show", "HEAD:hola.txt"), "preparado")
+        self.assertEqual(self.git("ls-tree", "--name-only", "HEAD"), "hola.txt")
+        info = self.service.inspect_repository(self.folder)
+        self.assertTrue(info.has_commits)
+        self.assertFalse(info.can_commit)
+        self.assertEqual(info.staged_files, ())
+        self.assertEqual({file.path for file in info.unstaged_files}, {"hola.txt", "nuevo.txt"})
+
+    def test_commit_accepts_literal_multiline_message_and_keeps_hash_lines(self):
+        self.prepare_commit()
+        message = "--amend 'comillas' `touch INYECTADO` $(touch INYECTADO)\n\n# Explicación con acentos 🌸"
+        self.git("config", "commit.cleanup", "strip")
+        self.service.commit(self.folder, message)
+        self.assertEqual(self.git("log", "-1", "--format=%B"), message)
+        self.assertFalse((self.folder / "INYECTADO").exists())
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_commit_rejects_empty_and_null_messages_without_changing_index(self):
+        self.prepare_commit()
+        before = self.git("ls-files", "--stage")
+        for message in ("", " \n\t ", "texto\0otro"):
+            with self.subTest(message=message), self.assertRaises(GitServiceError):
+                self.service.commit(self.folder, message)
+        self.assertEqual(self.git("ls-files", "--stage"), before)
+        self.assertFalse(self.service.inspect_repository(self.folder).has_commits)
+
+    def test_commit_revalidates_staging_after_external_unstage(self):
+        self.prepare_commit()
+        self.service.unstage_file(self.folder, "hola.txt")
+        with self.assertRaisesRegex(GitServiceError, "Prepará"):
+            self.service.commit(self.folder, "Mensaje válido")
+        self.assertFalse(self.service.inspect_repository(self.folder).has_commits)
+
+    def test_commit_from_subfolder_includes_prepared_files_in_repository_root(self):
+        self.prepare_commit()
+        nested = self.folder / "carpeta"
+        nested.mkdir()
+        (nested / "nuevo.txt").write_text("contenido", encoding="utf-8")
+        self.service.stage_all(nested)
+        self.service.commit(nested, "Cambios en todo el repositorio")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD"), "carpeta/nuevo.txt\nhola.txt")
+
+    def test_commit_missing_identity_shows_explanation_and_original_git_error(self):
+        self.prepare_commit()
+        self.git("config", "user.name", "")
+        self.git("config", "user.email", "")
+        self.git("config", "user.useConfigOnly", "true")
+        with self.assertRaises(GitServiceError) as error:
+            self.service.commit(self.folder, "Sin identidad")
+        self.assertIn("user.name", str(error.exception))
+        self.assertIn("commit", error.exception.command)
+        self.assertIn("Author identity unknown", error.exception.stderr)
+        self.assertTrue(self.service.inspect_repository(self.folder).can_commit)
+        self.assertEqual(self.git("config", "--get", "user.name"), "")
+
+    def test_commit_respects_rejecting_hook_and_preserves_staged_files(self):
+        self.prepare_commit()
+        hook = self.folder / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nprintf 'Rechazado por el hook de prueba\\n' >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o700)
+        before = self.git("ls-files", "--stage")
+        with self.assertRaises(GitServiceError) as error:
+            self.service.commit(self.folder, "No saltear hook")
+        self.assertIn("Rechazado por el hook", error.exception.stderr)
+        self.assertEqual(self.git("ls-files", "--stage"), before)
+        self.assertFalse(self.service.inspect_repository(self.folder).has_commits)
+
+    def test_commit_respects_message_hook_and_signing_configuration(self):
+        self.prepare_commit()
+        hook = self.folder / ".git" / "hooks" / "commit-msg"
+        hook.write_text("#!/bin/sh\nprintf '\\nValidado por hook\\n' >> \"$1\"\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.service.commit(self.folder, "Mensaje")
+        self.assertIn("Validado por hook", self.git("log", "-1", "--format=%B"))
+        (self.folder / "hola.txt").write_text("otro cambio", encoding="utf-8")
+        self.service.stage_all(self.folder)
+        signer = self.base / "firma.sh"
+        signer.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        signer.chmod(0o700)
+        self.git("config", "commit.gpgSign", "true")
+        self.git("config", "gpg.program", str(signer))
+        with self.assertRaises(GitServiceError) as error:
+            self.service.commit(self.folder, "Firma requerida")
+        self.assertIn("firmar", str(error.exception))
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_detached_commit_requires_explicit_opt_in(self):
+        self.prepare_commit()
+        self.service.commit(self.folder, "Primero")
+        self.git("checkout", "--detach")
+        (self.folder / "hola.txt").write_text("otro", encoding="utf-8")
+        self.service.stage_all(self.folder)
+        with self.assertRaisesRegex(GitServiceError, "HEAD separado"):
+            self.service.commit(self.folder, "Sin rama")
+        self.service.commit(self.folder, "Sin rama", allow_detached=True)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertIsNone(self.service.inspect_repository(self.folder).branch)
+
+    def test_commit_error_does_not_hide_index_lock(self):
+        self.prepare_commit()
+        (self.folder / ".git" / "index.lock").touch()
+        with self.assertRaises(GitServiceError) as error:
+            self.service.commit(self.folder, "Bloqueado")
+        self.assertIn("index.lock", error.exception.details)
+        self.assertFalse(self.service.inspect_repository(self.folder).has_commits)
 
 
 if __name__ == "__main__":
