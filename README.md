@@ -26,6 +26,7 @@ plataforma de referencia; la interfaz está disponible en español.
 - [Documentación](#documentación)
 - [Alcance](#alcance)
 - [Contribuir](#contribuir)
+- [Desarrollo con IA](#desarrollo-con-ia)
 - [Licencia](#licencia)
 
 ## Características
@@ -218,6 +219,12 @@ GIXSIE_RUN_UI_TESTS=1 /usr/bin/python3 -m unittest discover -v
 Las pruebas de Git, instalación y empaquetado utilizan carpetas temporales. La
 [guía de desarrollo](docs/DEVELOPMENT.md) detalla las comprobaciones manuales y
 los comandos para generar paquetes.
+
+## Desarrollo con IA
+
+Desarrollé este proyecto con la asistencia de **Codex, una IA de OpenAI**, para
+escribir y revisar código, preparar documentación y realizar pruebas. La idea,
+la dirección del proyecto y las decisiones finales estuvieron a mi cargo.
 
 ## Licencia
 
